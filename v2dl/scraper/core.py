@@ -84,8 +84,8 @@ class AlbumScraper(BaseScraper[AlbumResult]):
 class ImageScraper(BaseScraper[ImageResult]):
     """Strategy for scraping album image pages."""
 
-    XPATH_ALBUM = '//div[@class="album-photo my-2"]/img/@data-src'
-    XPATH_ALTS = '//div[@class="album-photo my-2"]/img/@alt'
+    XPATH_ALBUM = '//div[contains(@class,"album-photo")]/img/@data-src'
+    XPATH_ALTS = '//div[contains(@class,"album-photo")]/img/@alt'
     XPATH_VIP = ""
 
     def __init__(self, config: Config, album_tracker: AlbumTracker) -> None:
@@ -209,11 +209,5 @@ class ImageScraper(BaseScraper[ImageResult]):
         )
 
     def get_available_images(self, tree: html.HtmlElement) -> list[bool]:
-        album_photos = tree.xpath("//div[@class='album-photo my-2']")
-        image_status = [False] * len(album_photos)
-
-        for i, photo in enumerate(album_photos):
-            if photo.xpath(".//img[@data-src]"):
-                image_status[i] = True
-
-        return image_status
+        album_photos = tree.xpath('//div[contains(@class,"album-photo")][.//img[@data-src]]')
+        return [True] * len(album_photos)
