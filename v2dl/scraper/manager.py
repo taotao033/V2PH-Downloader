@@ -109,12 +109,30 @@ class ScrapeManager:
         self.logger.info("A total of %d albums found for %s", len(album_links), url)
 
         temp_original_url = self.runtime_config.url
+        success_count = 0
+        fail_count = 0
+        
         for album_url in album_links:
-            self.runtime_config.url = album_url
-            self.update_runtime_config(self.runtime_config)
-            await self.scrape_album(album_url, 1)
-            self.processed_urls.add(UrlHandler.remove_query_params(album_url))
+            try:
+                self.runtime_config.url = album_url
+                self.update_runtime_config(self.runtime_config)
+                await self.scrape_album(album_url, 1)
+                self.processed_urls.add(UrlHandler.remove_query_params(album_url))
+                success_count += 1
+            except Exception as e:
+                self.logger.error(
+                    "Error processing album %s: %s. Skipping to next album.",
+                    album_url,
+                    str(e),
+                )
+                fail_count += 1
+                continue
 
+        self.logger.info(
+            "Album list processing completed: %d successful, %d failed",
+            success_count,
+            fail_count,
+        )
         self.runtime_config.url = temp_original_url
         self.update_runtime_config(self.runtime_config)
 
@@ -128,20 +146,33 @@ class ScrapeManager:
             self.logger.info("Album %s already downloaded, skipping.", album_url)
             return
 
-        strategy = self.strategies["album_image"]
-        scraper = PageScraper(self.web_bot, strategy, self.logger)
+        try:
+            strategy = self.strategies["album_image"]
+            scraper = PageScraper(self.web_bot, strategy, self.logger)
 
-        image_links = await scraper.scrape_all_pages(album_url, target_page)
-        self.album_tracker.update_download_log(
-            album_url,  # 使用專輯 URL 而不是 runtime_config.url
-            {LogKey.expect_num: len(image_links)},
-        )
-        if not image_links:
-            return
+            image_links = await scraper.scrape_all_pages(album_url, target_page)
+            self.album_tracker.update_download_log(
+                album_url,  # 使用專輯 URL 而不是 runtime_config.url
+                {LogKey.expect_num: len(image_links)},
+            )
+            if not image_links:
+                self.logger.warning("No images found for album %s", album_url)
+                return
 
-        album_name = re.sub(r"\s*\d+$", "", image_links[0][1]) if image_links else "Unknown Album"
-        self.logger.info("Found %d images in album %s", len(image_links), album_name)
-        self.album_tracker.log_downloaded(clean_url)
+            album_name = re.sub(r"\s*\d+$", "", image_links[0][1]) if image_links else "Unknown Album"
+            self.logger.info("Found %d images in album %s", len(image_links), album_name)
+            self.album_tracker.log_downloaded(clean_url)
+        except Exception as e:
+            self.logger.error(
+                "Error scraping album %s: %s. Skipping to next album.",
+                album_url,
+                str(e),
+            )
+            # Update download log with failure status
+            self.album_tracker.update_download_log(
+                clean_url,
+                {LogKey.status: DownloadStatus.FAIL},
+            )
 
     def update_runtime_config(self, runtime_config: RuntimeConfig) -> None:
         if not isinstance(runtime_config, RuntimeConfig):
@@ -197,50 +228,97 @@ class PageScraper(Generic[PageResultType]):
             url,
         )
 
-        while True:
-            page_results, should_continue = await self.scrape_page(url, page)
-            all_results.extend(page_results)
+        consecutive_failures = 0
+        max_consecutive_failures = 3
 
-            page = UrlHandler.handle_pagination(page, target_page)
-            if not should_continue or scrape_one_page or page is None:
-                break
+        while True:
+            try:
+                page_results, should_continue = await self.scrape_page(url, page)
+                all_results.extend(page_results)
+
+                # Reset consecutive failures counter on success
+                if page_results or should_continue:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+
+                # If we've had too many consecutive failures, stop
+                if consecutive_failures >= max_consecutive_failures:
+                    self.logger.error(
+                        "Too many consecutive page failures (%d), stopping scraping for %s",
+                        consecutive_failures,
+                        url,
+                    )
+                    break
+
+                page = UrlHandler.handle_pagination(page, target_page)
+                if not should_continue or scrape_one_page or page is None:
+                    break
+            except Exception as e:
+                self.logger.error(
+                    "Unexpected error while scraping page %s from %s: %s. Continuing to next page.",
+                    page,
+                    url,
+                    str(e),
+                )
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    self.logger.error(
+                        "Too many consecutive errors (%d), stopping scraping for %s",
+                        consecutive_failures,
+                        url,
+                    )
+                    break
+                page = UrlHandler.handle_pagination(page, target_page)
+                if scrape_one_page or page is None:
+                    break
 
         return all_results
 
     async def scrape_page(self, url: str, page: int) -> tuple[list[PageResultType], bool]:
         """Scrape a single page and return results and continuation flag."""
         full_url = UrlHandler.add_page_num(url, page)
-        html_content = await self.web_bot.auto_page_scroll(full_url, page_sleep=0)
-        tree = UrlHandler.parse_html(html_content, self.logger)
+        try:
+            html_content = await self.web_bot.auto_page_scroll(full_url, page_sleep=0)
+            tree = UrlHandler.parse_html(html_content, self.logger)
 
-        if tree is None:
-            return [], False
+            if tree is None:
+                self.logger.warning("Failed to parse HTML for page %d, skipping", page)
+                return [], False
 
-        if self.strategy.is_vip_page(tree):
-            _url = UrlHandler.remove_query_params(full_url)
-            self.strategy.album_tracker.update_download_log(
-                _url, {LogKey.status: DownloadStatus.VIP}
-            )
-            return [], False
+            if self.strategy.is_vip_page(tree):
+                _url = UrlHandler.remove_query_params(full_url)
+                self.strategy.album_tracker.update_download_log(
+                    _url, {LogKey.status: DownloadStatus.VIP}
+                )
+                return [], False
 
-        self.logger.info("Fetching content from %s", full_url)
-        page_links = tree.xpath(self.strategy.get_xpath())
+            self.logger.info("Fetching content from %s", full_url)
+            page_links = tree.xpath(self.strategy.get_xpath())
 
-        scrape_type = "album_list" if isinstance(self.strategy, AlbumScraper) else "album_image"
-        if not page_links:
-            self.logger.info(
-                "No more %s found on page %d",
-                "albums" if scrape_type == "album_list" else "images",
+            scrape_type = "album_list" if isinstance(self.strategy, AlbumScraper) else "album_image"
+            if not page_links:
+                self.logger.info(
+                    "No more %s found on page %d",
+                    "albums" if scrape_type == "album_list" else "images",
+                    page,
+                )
+                return [], False
+
+            page_result: list[PageResultType] = []
+            await self.strategy.process_page_links(url, page_links, page_result, tree, page)
+
+            # Check if we've reached the last page
+            should_continue = page < UrlHandler.get_max_page(tree)
+            if not should_continue:
+                self.logger.info("Reach last page, stopping")
+
+            return page_result, should_continue
+        except Exception as e:
+            self.logger.error(
+                "Error scraping page %d from %s: %s. Skipping this page.",
                 page,
+                full_url,
+                str(e),
             )
             return [], False
-
-        page_result: list[PageResultType] = []
-        await self.strategy.process_page_links(url, page_links, page_result, tree, page)
-
-        # Check if we've reached the last page
-        should_continue = page < UrlHandler.get_max_page(tree)
-        if not should_continue:
-            self.logger.info("Reach last page, stopping")
-
-        return page_result, should_continue
