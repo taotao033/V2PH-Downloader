@@ -306,7 +306,21 @@ class PageScraper(Generic[PageResultType]):
                 return [], False
 
             page_result: list[PageResultType] = []
-            await self.strategy.process_page_links(url, page_links, page_result, tree, page)
+            # Snapshot browser session cookies so ImageScraper can reuse them
+            # for cdn.v2ph.com downloads (Cloudflare blocks raw httpx requests).
+            try:
+                browser_cookies = self.web_bot.get_cookies()
+            except Exception as e:
+                self.logger.debug("Unable to snapshot browser cookies: %s", e)
+                browser_cookies = {}
+            await self.strategy.process_page_links(
+                url,
+                page_links,
+                page_result,
+                tree,
+                page,
+                cookies=browser_cookies,
+            )
 
             # Check if we've reached the last page
             should_continue = page < UrlHandler.get_max_page(tree)

@@ -62,6 +62,38 @@ class DrissionBot(BaseBot):
     def close_driver(self) -> None:
         self.page.quit()
 
+    def get_cookies(self) -> dict[str, str]:
+        """Snapshot the live cookies of the DrissionPage browser session.
+
+        The CDN (cdn.v2ph.com) is Cloudflare-protected and rejects requests
+        that do not carry the same session cookies as the v2ph.com browser
+        tab, so we re-export them for the httpx downloader.
+        """
+        # DrissionPage 4.x: page.cookies() always returns a CookiesList of
+        # dict-like items; the ``as_dict`` kwarg does not exist on
+        # ChromiumBase.cookies, so we normalize the list ourselves.
+        try:
+            raw = self.page.cookies()
+        except Exception as e:
+            self.logger.warning("Failed to read browser cookies: %s", e)
+            return {}
+
+        cookies: dict[str, str] = {}
+        if isinstance(raw, dict):
+            for name, value in raw.items():
+                if value is None:
+                    continue
+                cookies[str(name)] = str(value)
+        else:
+            for item in raw or []:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                value = item.get("value")
+                if name and value is not None:
+                    cookies[str(name)] = str(value)
+        return cookies
+
     async def auto_page_scroll(
         self,
         url: str,

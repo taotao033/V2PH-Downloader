@@ -77,6 +77,27 @@ class SeleniumBot(BaseBot):
         self.driver.quit()
         self.chrome_process.terminate()
 
+    def get_cookies(self) -> dict[str, str]:
+        """Snapshot the live cookies of the Selenium browser session.
+
+        Mirrors ``DrissionBot.get_cookies`` so the httpx downloader can reuse
+        the authenticated session and bypass Cloudflare hotlink protection
+        on cdn.v2ph.com.
+        """
+        try:
+            raw = self.driver.get_cookies()
+        except Exception as e:
+            self.logger.warning("Failed to read browser cookies: %s", e)
+            return {}
+
+        cookies: dict[str, str] = {}
+        for item in raw or []:
+            name = item.get("name") if isinstance(item, dict) else None
+            value = item.get("value") if isinstance(item, dict) else None
+            if name and value is not None:
+                cookies[str(name)] = str(value)
+        return cookies
+
     async def auto_page_scroll(
         self,
         url: str,

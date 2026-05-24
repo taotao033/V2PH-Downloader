@@ -79,6 +79,15 @@ class BaseBot(ABC):
         """Simulate human-like typing into a field."""
         raise NotImplementedError("Subclasses must implement scroll behavior.")
 
+    def get_cookies(self) -> dict[str, str]:
+        """Return current browser session cookies as a {name: value} dict.
+
+        Subclasses should override this to expose the live session so that
+        out-of-band downloaders (e.g. httpx) can reuse the authenticated
+        session and bypass anti-hotlink / Cloudflare checks on the CDN.
+        """
+        return {}
+
     def scroll_page(self) -> None:
         """Simulate human-like scrolling behavior."""
         raise NotImplementedError("Subclasses must implement scroll behavior.")

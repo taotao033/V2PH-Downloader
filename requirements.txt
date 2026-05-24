@@ -8,7 +8,11 @@ certifi==2024.8.30
     #   httpx
     #   requests
 cffi==1.17.1
-    # via pynacl
+    # via
+    #   curl-cffi
+    #   pynacl
+curl-cffi==0.7.4
+    # via v2dl (pyproject.toml)
 charset-normalizer==3.4.0
     # via requests
 click==8.1.7

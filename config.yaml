@@ -7,7 +7,7 @@ static_config:
     Accept-Language: "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
     Cache-Control: "no-cache"
     Connection: "keep-alive"
-    Referer: "https://www.google.com/"
+    Referer: "https://www.v2ph.com/"
     sec-fetch-dest: "image"
     sec-fetch-mode: "no-cors"
     sec-fetch-site: "same-site"
