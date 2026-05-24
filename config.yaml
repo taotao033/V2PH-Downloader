@@ -11,7 +11,7 @@ static_config:
     sec-fetch-dest: "image"
     sec-fetch-mode: "no-cors"
     sec-fetch-site: "same-site"
-  language: "ja"
+  language: "zh"
   chrome_args: null
   no_metadata: false
   force_download: false
