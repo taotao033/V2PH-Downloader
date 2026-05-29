@@ -8,6 +8,7 @@ from typing import Any, Generic
 
 import httpx
 from lxml import html
+from pathvalidate import sanitize_filename
 
 from v2dl.common import Config
 from v2dl.common.const import BASE_URL, HEADERS, IMAGE_PER_PAGE, VALID_EXTENSIONS
@@ -160,6 +161,15 @@ class AlbumScraper(BaseScraper[AlbumResult]):
 
     XPATH_ALBUM_LIST = '//a[@class="media-cover"]/@href'
 
+    def __init__(self, config: Config, album_tracker: AlbumTracker) -> None:
+        super().__init__(config, album_tracker)
+        # Best-effort name of the current listing (e.g. an actor's display
+        # name from the breadcrumb/title). Populated on the first page of
+        # a listing so ``ScrapeManager`` can prefer it over the raw URL
+        # slug when grouping downloads. The manager resets this between
+        # listings because the strategy instance is shared.
+        self.last_display_name: str | None = None
+
     def get_xpath(self) -> str:
         return self.XPATH_ALBUM_LIST
 
@@ -172,6 +182,15 @@ class AlbumScraper(BaseScraper[AlbumResult]):
         page_num: int,
         **kwargs: Any,
     ) -> None:
+        # First page wins: pagination on the same listing should not churn
+        # the captured name (page 2+ sometimes has a "第N页" decoration that
+        # ``extract_listing_display_name`` already strips, but a fresh probe
+        # is still wasted work).
+        if self.last_display_name is None:
+            try:
+                self.last_display_name = UrlHandler.extract_listing_display_name(tree)
+            except Exception:
+                self.last_display_name = None
         page_result.extend([BASE_URL + album_link for album_link in page_links])
         self.logger.info("Found %d albums on page %d", len(page_links), page_num)
 
@@ -179,8 +198,20 @@ class AlbumScraper(BaseScraper[AlbumResult]):
 class ImageScraper(BaseScraper[ImageResult]):
     """Strategy for scraping album image pages."""
 
-    XPATH_ALBUM = '//div[contains(@class,"album-photo")]/img/@data-src'
-    XPATH_ALTS = '//div[contains(@class,"album-photo")]/img/@alt'
+    # v2ph swapped a JS lazyload (URL kept in ``data-src`` until the
+    # image scrolled into view) for native ``loading="lazy"`` /
+    # ``decoding="async"`` on a real ``src`` attribute, so we now read
+    # ``@src`` directly. Both the wrapper div AND the inner img carry
+    # an ``album-photo`` class, so we match the wrapper as a whole-token
+    # class to avoid picking up unrelated ``album-photo-*`` variants.
+    # The ``http``-starts-with filter excludes the few site assets that
+    # still ship as relative paths (e.g. ``/img/logo-ja.svg``).
+    _XPATH_IMG = (
+        '//div[contains(concat(" ", normalize-space(@class), " "),'
+        ' " album-photo ")]/img[starts-with(@src, "http")]'
+    )
+    XPATH_ALBUM = f'{_XPATH_IMG}/@src'
+    XPATH_ALTS = f'{_XPATH_IMG}/@alt'
     XPATH_VIP = ""
 
     def __init__(self, config: Config, album_tracker: AlbumTracker) -> None:
@@ -190,6 +221,25 @@ class ImageScraper(BaseScraper[ImageResult]):
         self._warned_no_curl_cffi = False
         self._proxy_logged = False
         self._doh_logged = False
+        self._browser_lock = asyncio.Lock()
+        self._prefer_browser_only = False
+        self._browser_path_logged = False
+        # Optional per-listing subdirectory under ``download_dir``. Set
+        # by ``ScrapeManager`` around an ``album_list`` scrape so every
+        # album collected from the same listing (e.g. one actor / one
+        # company) ends up grouped together. ``None`` means no grouping.
+        self._parent_slug: str | None = None
+
+    def set_parent_slug(self, slug: str | None) -> None:
+        """Configure (or clear) the per-listing subdirectory under which
+        subsequent album downloads should be placed.
+
+        Pass ``None`` to remove the grouping. The slug is sanitised at
+        path-construction time, so the caller can pass raw site strings
+        (incl. non-ASCII / spaces).
+        """
+        slug = (slug or "").strip()
+        self._parent_slug = slug or None
 
     def get_xpath(self) -> str:
         return self.XPATH_ALBUM
@@ -199,6 +249,7 @@ class ImageScraper(BaseScraper[ImageResult]):
         url: str,
         dest: Path,
         cookies: dict[str, str] | None = None,
+        web_bot: Any = None,
     ) -> bool:
         if DownloadPathTool.is_file_exists(
             dest,
@@ -221,6 +272,38 @@ class ImageScraper(BaseScraper[ImageResult]):
             self.logger.error("Error creating directory '%s': %s", dest.parent, e)
             return False
 
+        # Path 1: download through the browser's own warmed cdn.v2ph.com tab.
+        # This is by far the most reliable route on networks where Cloudflare
+        # rejects curl-cffi (the request is same-origin to cdn.v2ph.com and
+        # uses the exact TLS / cookie context that already cleared CF). When
+        # the bot has no warmed tab (e.g. ``ensure_cdn_warmed`` failed or the
+        # caller is not the image scraper), ``browser_fetch`` returns ``None``
+        # and we transparently fall through to curl-cffi.
+        if web_bot is not None:
+            outcome = await self._download_with_browser_fetch(url, dest, web_bot)
+            if outcome is True:
+                return True
+            if outcome is False:
+                # The browser itself talked to the CDN and got back a real
+                # HTTP error (403 / 404 / VIP-only etc). curl-cffi can only
+                # do worse from this network, so don't waste a request on it.
+                return False
+            # outcome is None: no warmed tab or transient JS failure - try
+            # curl-cffi as a fallback so a missing browser path doesn't
+            # silently halt downloads.
+
+        if self._prefer_browser_only:
+            # We've previously committed to the browser path because
+            # curl-cffi was blanket-blocked. Don't reopen that wound; just
+            # report the failure for this image.
+            self.logger.error(
+                "Skipping curl-cffi for %s: browser-routed downloads are"
+                " required on this network and the warmed CDN tab is"
+                " currently unavailable.",
+                url,
+            )
+            return False
+
         if HAS_CURL_CFFI:
             return await self._download_with_curl_cffi(url, dest, headers, cookies)
 
@@ -233,6 +316,124 @@ class ImageScraper(BaseScraper[ImageResult]):
             )
             self._warned_no_curl_cffi = True
         return await self._download_with_httpx(url, dest, headers, cookies)
+
+    async def _download_with_browser_fetch(
+        self,
+        url: str,
+        dest: Path,
+        web_bot: Any,
+    ) -> bool | None:
+        """Download ``url`` via the warmed cdn.v2ph.com browser tab.
+
+        Returns:
+            True  - downloaded and written to ``dest`` successfully.
+            False - the browser reached the CDN but the CDN returned an
+                    HTTP error (403 / 404 / VIP-only). The caller should
+                    NOT fall back to curl-cffi.
+            None  - the bot has no warmed CDN tab, the tab has died, or
+                    the in-page fetch raised a JS-level error before
+                    reaching the network. The caller may fall back to
+                    curl-cffi.
+        """
+        fetch = getattr(web_bot, "browser_fetch", None)
+        if fetch is None:
+            return None
+
+        loop = asyncio.get_running_loop()
+        # Serialise: the warmed tab is a single shared resource, and CDP
+        # ``run_js`` calls cannot be safely interleaved against the same
+        # target.
+        async with self._browser_lock:
+            try:
+                result = await loop.run_in_executor(None, fetch, url)
+            except Exception as e:
+                self.logger.debug("browser_fetch raised for %s: %s", url, e)
+                return None
+
+        if result is None:
+            return None
+
+        try:
+            status_code, body = result
+        except Exception:
+            self.logger.debug("Unexpected browser_fetch result for %s: %r", url, result)
+            return None
+
+        # status_code == 0 is the JS-side "request never made it onto the
+        # network" sentinel (e.g. NetworkError, tab discarded). Treat as a
+        # transient miss and let the caller fall back.
+        if status_code == 0:
+            return None
+
+        if status_code >= 400:
+            hint = ""
+            if status_code == 403:
+                hint = (
+                    " (Cloudflare blocked even the same-origin in-page fetch;"
+                    " the asset may be VIP-only, removed, or the cf_clearance"
+                    " has just expired - try re-running)"
+                )
+            elif status_code == 404:
+                hint = " (asset no longer on the CDN)"
+            self.logger.error(
+                "browser_fetch HTTP %d for %s%s",
+                status_code,
+                url,
+                hint,
+            )
+            return False
+
+        if not body:
+            self.logger.warning(
+                "browser_fetch returned status=%d but empty body for %s",
+                status_code,
+                url,
+            )
+            return None
+
+        ext = "." + DownloadPathTool.get_image_ext(url, "jpg", VALID_EXTENSIONS)
+        dest = dest.with_suffix(ext)
+
+        try:
+            await self._write_bytes(dest, body)
+        except Exception as e:
+            self.logger.error("Error writing '%s': %s", dest, e)
+            return False
+
+        if not self._browser_path_logged:
+            self.logger.info(
+                "Routing image downloads through the warmed cdn.v2ph.com"
+                " browser tab (same-origin fetch); curl-cffi will only be"
+                " used as a fallback."
+            )
+            self._browser_path_logged = True
+            # Sticky flag: if curl-cffi later 403s and the browser path is
+            # working, lock in the browser-only behaviour.
+            self._prefer_browser_only = True
+
+        self.logger.info("Downloaded: '%s'", dest)
+        return True
+
+    async def _write_bytes(self, dest: Path, body: bytes) -> None:
+        """Write ``body`` to ``dest`` honouring ``rate_limit`` (KB/s).
+
+        We do the actual file IO in the default executor so we don't block
+        the event loop for big images, then sleep to enforce the configured
+        bandwidth ceiling.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _write() -> None:
+            with open(dest, "wb") as f:
+                f.write(body)
+
+        await loop.run_in_executor(None, _write)
+
+        speed_limit_kbps = self.config.static_config.rate_limit
+        if speed_limit_kbps:
+            expected_time = len(body) / (speed_limit_kbps * 1024)
+            if expected_time > 0:
+                await asyncio.sleep(expected_time)
 
     async def _download_with_curl_cffi(
         self,
@@ -459,11 +660,24 @@ class ImageScraper(BaseScraper[ImageResult]):
 
         album_name = UrlHandler.extract_album_name(alts)
         dir_ = self.config.static_config.download_dir
+        # When the manager set a per-listing slug (e.g. the actor's
+        # display name), nest album folders under it so a listing scrape
+        # produces ``<download_dir>/<listing>/<album>/...`` instead of
+        # mixing every album under the global download root. Sanitised
+        # here because ``download_root`` is not sanitised by
+        # ``DownloadPathTool.get_file_dest`` (only the album name is).
+        if self._parent_slug:
+            dir_ = str(Path(dir_) / sanitize_filename(self._parent_slug))
 
         # Cookies snapshotted from the live browser session in PageScraper.
         # Forwarded so cdn.v2ph.com sees the same authenticated session and
         # does not return 403 Forbidden via Cloudflare hotlink protection.
         cookies = kwargs.get("cookies") or None
+        # The bot is forwarded so ``download_file`` can route through the
+        # warmed cdn.v2ph.com tab via ``browser_fetch`` - the only path
+        # that reliably clears Cloudflare on networks where curl-cffi's
+        # TLS impersonation is no longer enough.
+        web_bot = kwargs.get("web_bot")
 
         download_tasks = []
         download_paths = []
@@ -479,7 +693,9 @@ class ImageScraper(BaseScraper[ImageResult]):
 
             filename = f"{(idx + i):03d}"
             dest = DownloadPathTool.get_file_dest(dir_, album_name, filename)
-            download_tasks.append(self.download_file(image_url, dest, cookies=cookies))
+            download_tasks.append(
+                self.download_file(image_url, dest, cookies=cookies, web_bot=web_bot)
+            )
             download_paths.append(dest)
 
         if download_tasks:
@@ -502,5 +718,8 @@ class ImageScraper(BaseScraper[ImageResult]):
         )
 
     def get_available_images(self, tree: html.HtmlElement) -> list[bool]:
-        album_photos = tree.xpath('//div[contains(@class,"album-photo")][.//img[@data-src]]')
+        album_photos = tree.xpath(
+            '//div[contains(concat(" ", normalize-space(@class), " "),'
+            ' " album-photo ")][.//img[starts-with(@src, "http")]]'
+        )
         return [True] * len(album_photos)

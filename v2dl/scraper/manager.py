@@ -331,6 +331,8 @@ class PageScraper(Generic[PageResultType]):
                     "albums" if scrape_type == "album_list" else "images",
                     page,
                 )
+                if scrape_type == "album_image" and page == 1:
+                    self._log_empty_image_page_diagnostics(full_url, html_content, tree)
                 return [], False
 
             page_result: list[PageResultType] = []
@@ -379,3 +381,273 @@ class PageScraper(Generic[PageResultType]):
                 str(e),
             )
             return [], False
+
+    def _log_empty_image_page_diagnostics(
+        self,
+        full_url: str,
+        html_content: str,
+        tree: Any,
+    ) -> None:
+        """One-shot diagnostic for the "Fetching content ... -> No more
+        images found on page 1" case.
+
+        Cloudflare-cleared but image-less is almost always one of:
+        captcha (image / Turnstile re-check), login redirect, VIP
+        upgrade card, language redirect, or a layout change. We probe
+        the parsed tree for each signal and log a single, actionable
+        line so the user knows what to fix instead of staring at an
+        empty result. The raw HTML is dumped to a file (capped) so
+        layout-change cases can be reported upstream without losing
+        the evidence.
+        """
+        try:
+            page_url = ""
+            try:
+                page_url = getattr(self.web_bot, "page", None).url or ""  # type: ignore[union-attr]
+            except Exception:
+                page_url = ""
+
+            page_title = ""
+            try:
+                page_title = (getattr(self.web_bot, "page", None).title or "")[:120]  # type: ignore[union-attr]
+            except Exception:
+                page_title = ""
+
+            html_len = len(html_content) if html_content else 0
+            lower_html = (html_content or "").lower()
+
+            # Probe order: most specific signal first.
+            signals: list[str] = []
+
+            # Cloudflare interstitial / challenge still on the page.
+            # ``cdn-cgi/challenge`` and ``challenges.cloudflare.com`` are
+            # NOT used here even though they look CF-y: they appear in
+            # preconnect <link> hints / CSP / residual scripts on EVERY
+            # CF-fronted page even after the challenge cleared, and
+            # would produce false positives on real album pages.
+            if (
+                "just a moment" in lower_html
+                or 'name="cf-chl-bypass"' in lower_html
+                or "__cf_chl_" in lower_html
+                or "checking your browser" in lower_html
+                or "正在进行安全验证" in (html_content or "")
+                or "正在進行安全驗證" in (html_content or "")
+            ):
+                signals.append(
+                    "Cloudflare challenge HTML still present (CF cleared "
+                    "the interstitial visually but the album page itself "
+                    "served a fresh challenge). Try re-running once the "
+                    "browser cookie store has new cf_clearance / __cf_bm."
+                )
+
+            # v2ph image captcha (the 4-character coloured-noise card).
+            if (
+                'id="album-captcha-form"' in lower_html
+                or 'id="captcha-image"' in lower_html
+                or 'id="captcha_code"' in lower_html
+                or 'class="captcha-container' in lower_html
+            ):
+                signals.append(
+                    "v2ph image captcha is on the album page and was NOT "
+                    "auto-solved. Install ddddocr (`pip install v2dl[ocr]`) "
+                    "or solve the captcha manually in the open browser, "
+                    "then re-run."
+                )
+
+            # Login / read-limit interception.
+            if (
+                'class="login-box-msg"' in lower_html
+                or 'name="email"' in lower_html and 'name="password"' in lower_html
+            ):
+                signals.append(
+                    "The album URL redirected to the login page. Check "
+                    "that your session cookies are valid (or run "
+                    "`v2dl --bot drissionpage <album-url>` once "
+                    "interactively to refresh the cookie file)."
+                )
+
+            # VIP upgrade card. We re-use the same xpath the strategy
+            # uses, but since the page wasn't recognised as VIP earlier
+            # this catches the looser variant.
+            try:
+                if tree is not None and tree.xpath(
+                    '//a[contains(@href, "/user/upgrade")]'
+                ):
+                    signals.append(
+                        "Page contains a 'Upgrade to VIP' link - the "
+                        "album is likely VIP-only on this account."
+                    )
+            except Exception:
+                pass
+
+            # Language / locale redirect: the URL we asked for had a
+            # specific ``hl=`` and the browser ended up on a different
+            # one. v2ph silently downgrades unknown codes to en, which
+            # also strips the album body for some legacy URLs.
+            if "hl=" in full_url and "hl=" in page_url and full_url != page_url:
+                if "hl=" in page_url and "hl=" in full_url:
+                    asked = full_url.split("hl=", 1)[1].split("&", 1)[0]
+                    got = page_url.split("hl=", 1)[1].split("&", 1)[0]
+                    if asked.lower() != got.lower():
+                        signals.append(
+                            f"Language redirect: requested hl={asked} but "
+                            f"the browser settled on hl={got}. v2ph maps "
+                            "unknown codes to English which can blank "
+                            "the album body - try a canonical code from "
+                            "AVAILABLE_LANGUAGES."
+                        )
+
+            # Bare layout-change fallback: the body has v2ph chrome but
+            # neither album-photo nor any of the above markers. Likely
+            # an HTML structure change.
+            if not signals:
+                has_v2ph_chrome = "v2ph" in lower_html or "微图坊" in (html_content or "")
+                if has_v2ph_chrome:
+                    signals.append(
+                        "Album page rendered but contains no "
+                        "<div class='album-photo'> elements and no "
+                        "captcha / login / VIP / CF markers. The HTML "
+                        "structure may have changed upstream - dumping "
+                        "the page so you can grep it / file an issue."
+                    )
+                else:
+                    signals.append(
+                        "Page HTML does not look like a v2ph album "
+                        "(no v2ph chrome, no images). The browser may "
+                        "be on a different URL than expected."
+                    )
+
+            self.logger.warning(
+                "Empty-album diagnostic for %s: browser_url=%r title=%r "
+                "html_len=%d :: %s",
+                full_url,
+                page_url,
+                page_title,
+                html_len,
+                " | ".join(signals),
+            )
+
+            self._log_html_layout_samples(html_content)
+            self._dump_empty_album_html(full_url, html_content)
+        except Exception as e:
+            self.logger.warning("Empty-album diagnostic itself failed: %s", e)
+
+    def _log_html_layout_samples(self, html_content: str) -> None:
+        """Inline HTML fragments that actually matter for figuring out
+        the new image markup. Always logged at warning level so they
+        survive default log config (info+); we don't rely on the disk
+        dump because filesystem encoding / permissions can swallow it
+        silently.
+        """
+        if not html_content:
+            return
+
+        snippet_max = 240
+
+        def _trim(s: str) -> str:
+            s = re.sub(r"\s+", " ", s).strip()
+            return (s[: snippet_max - 3] + "...") if len(s) > snippet_max else s
+
+        photo_divs = re.findall(
+            r"<div[^>]*(?:photo|album|gallery)[^>]*>", html_content, re.IGNORECASE
+        )
+        if photo_divs:
+            self.logger.warning(
+                "Layout sample - first 'photo/album/gallery' divs (%d total):",
+                len(photo_divs),
+            )
+            for tag in photo_divs[:5]:
+                self.logger.warning("  %s", _trim(tag))
+        else:
+            self.logger.warning(
+                "Layout sample - NO div tags mentioning photo/album/gallery"
+                " in attributes."
+            )
+
+        imgs = re.findall(r"<img[^>]*>", html_content, re.IGNORECASE)
+        if imgs:
+            self.logger.warning(
+                "Layout sample - first <img> tags (%d total):", len(imgs)
+            )
+            for tag in imgs[:6]:
+                self.logger.warning("  %s", _trim(tag))
+        else:
+            self.logger.warning(
+                "Layout sample - NO <img> tags at all (album body did not"
+                " render)."
+            )
+
+        dsrc_count = len(re.findall(r"\bdata-src\s*=", html_content, re.IGNORECASE))
+        self.logger.warning(
+            "Layout sample - data-src attribute count=%d", dsrc_count
+        )
+
+        class_names: set[str] = set()
+        for m in re.finditer(
+            r'class\s*=\s*"([^"]+)"', html_content, re.IGNORECASE
+        ):
+            for cls in m.group(1).split():
+                low = cls.lower()
+                if any(
+                    needle in low
+                    for needle in ("photo", "album", "gallery", "image", "thumb")
+                ):
+                    class_names.add(cls)
+        if class_names:
+            self.logger.warning(
+                "Layout sample - candidate wrapper classes: %s",
+                ", ".join(sorted(class_names)[:20]),
+            )
+
+    def _dump_empty_album_html(self, full_url: str, html_content: str) -> None:
+        """Persist the offending HTML so we have raw evidence. Tries
+        several fallback locations because the configured download_dir
+        often contains non-ASCII characters that can trip mkdir on some
+        filesystems / locales.
+        """
+        if not html_content:
+            return
+
+        from pathlib import Path
+        from tempfile import gettempdir
+
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", full_url)[-80:]
+        filename = f"v2dl_empty_album_{slug}.html"
+        data = html_content[: 256 * 1024]
+
+        candidates: list[Path] = []
+        # ``self`` is a ``PageScraper`` which doesn't own the Config
+        # directly - the Config lives on the strategy. Be defensive in
+        # case future strategies don't expose it either.
+        static_config = getattr(getattr(self, "strategy", None), "config", None)
+        static_config = getattr(static_config, "static_config", None)
+        log_path = getattr(static_config, "system_log_path", "") or ""
+        if log_path:
+            candidates.append(Path(log_path).parent)
+        download_dir = getattr(static_config, "download_dir", "") or ""
+        if download_dir:
+            candidates.append(Path(download_dir))
+        candidates.append(Path(gettempdir()))
+        candidates.append(Path.cwd())
+
+        last_err: Exception | None = None
+        for target_dir in candidates:
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                dump_path = target_dir / filename
+                dump_path.write_text(data, encoding="utf-8", errors="replace")
+                self.logger.warning(
+                    "Wrote first %d bytes of the offending album HTML to %s",
+                    len(data),
+                    dump_path,
+                )
+                return
+            except Exception as e:
+                last_err = e
+                continue
+
+        self.logger.warning(
+            "Failed to dump empty-album HTML to any of %s: %s",
+            [str(p) for p in candidates],
+            last_err,
+        )
