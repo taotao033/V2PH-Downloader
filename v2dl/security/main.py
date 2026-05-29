@@ -280,7 +280,7 @@ class AccountManager:
     def _load_yaml_accounts(self) -> dict[str, Any]:
         """從 YAML 檔案載入帳號資料"""
         try:
-            with open(self.yaml_file_path) as file:
+            with open(self.yaml_file_path, encoding="utf-8") as file:
                 return yaml.safe_load(file) or {}
         except FileNotFoundError:
             return {}
@@ -288,8 +288,8 @@ class AccountManager:
     def _save_yaml_accounts(self) -> None:
         if self.yaml_accounts:
             with self.lock:
-                with open(self.yaml_file_path, "w") as file:
-                    yaml.dump(self.yaml_accounts, file, default_flow_style=False)
+                with open(self.yaml_file_path, "w", encoding="utf-8") as file:
+                    yaml.dump(self.yaml_accounts, file, default_flow_style=False, allow_unicode=True)
 
     def create_yaml_account(
         self, username: str, password: str, cookies: str, public_key: PublicKey

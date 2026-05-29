@@ -103,30 +103,58 @@ class ScrapeManager:
     async def scrape_album_list(self, url: str, target_page: int | list[int]) -> None:
         """Handle scraping of album lists."""
         strategy = self.strategies["album_list"]
+        # Reset the last-seen display name so this listing's name doesn't
+        # leak across consecutive scrape_album_list calls (the strategy
+        # instance is shared across all URLs in a sync run).
+        if isinstance(strategy, AlbumScraper):
+            strategy.last_display_name = None
         scraper = PageScraper(self.web_bot, strategy, self.logger)
 
         album_links = await scraper.scrape_all_pages(url, target_page)
         self.logger.info("A total of %d albums found for %s", len(album_links), url)
 
+        # Pick the most user-friendly name for the per-listing subdirectory:
+        # prefer the page-visible name (e.g. "网络美女") captured by
+        # AlbumScraper, fall back to the URL slug (e.g. "Beautyleg").
+        parent_slug: str | None = None
+        if isinstance(strategy, AlbumScraper):
+            parent_slug = strategy.last_display_name
+        if not parent_slug:
+            parent_slug = UrlHandler.extract_listing_slug(url)
+
+        image_strategy = self.strategies["album_image"]
+        if isinstance(image_strategy, ImageScraper):
+            image_strategy.set_parent_slug(parent_slug)
+            if parent_slug:
+                self.logger.info(
+                    "Grouping downloads from %s under subdirectory '%s'",
+                    UrlHandler.remove_query_params(url),
+                    parent_slug,
+                )
+
         temp_original_url = self.runtime_config.url
         success_count = 0
         fail_count = 0
-        
-        for album_url in album_links:
-            try:
-                self.runtime_config.url = album_url
-                self.update_runtime_config(self.runtime_config)
-                await self.scrape_album(album_url, 1)
-                self.processed_urls.add(UrlHandler.remove_query_params(album_url))
-                success_count += 1
-            except Exception as e:
-                self.logger.error(
-                    "Error processing album %s: %s. Skipping to next album.",
-                    album_url,
-                    str(e),
-                )
-                fail_count += 1
-                continue
+
+        try:
+            for album_url in album_links:
+                try:
+                    self.runtime_config.url = album_url
+                    self.update_runtime_config(self.runtime_config)
+                    await self.scrape_album(album_url, 1)
+                    self.processed_urls.add(UrlHandler.remove_query_params(album_url))
+                    success_count += 1
+                except Exception as e:
+                    self.logger.error(
+                        "Error processing album %s: %s. Skipping to next album.",
+                        album_url,
+                        str(e),
+                    )
+                    fail_count += 1
+                    continue
+        finally:
+            if isinstance(image_strategy, ImageScraper):
+                image_strategy.set_parent_slug(None)
 
         self.logger.info(
             "Album list processing completed: %d successful, %d failed",
@@ -306,6 +334,20 @@ class PageScraper(Generic[PageResultType]):
                 return [], False
 
             page_result: list[PageResultType] = []
+            # For image albums, kick the browser through Cloudflare's
+            # bot-management handshake for cdn.v2ph.com BEFORE we
+            # snapshot cookies. The CDN is a separate CF zone, so its
+            # ``__cf_bm`` / ``cf_clearance`` only appear in the jar
+            # after the browser has actually loaded a CDN URL. Without
+            # this, the cookies forwarded to curl-cffi cover only
+            # www.v2ph.com and the CDN returns 403 "Just a moment...".
+            # ``ensure_cdn_warmed`` is idempotent across the session.
+            if scrape_type == "album_image" and page_links:
+                try:
+                    self.web_bot.ensure_cdn_warmed(page_links[0])
+                except Exception as e:
+                    self.logger.debug("CDN warmup raised: %s", e)
+
             # Snapshot browser session cookies so ImageScraper can reuse them
             # for cdn.v2ph.com downloads (Cloudflare blocks raw httpx requests).
             try:
@@ -320,6 +362,7 @@ class PageScraper(Generic[PageResultType]):
                 tree,
                 page,
                 cookies=browser_cookies,
+                web_bot=self.web_bot,
             )
 
             # Check if we've reached the last page

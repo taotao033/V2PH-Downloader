@@ -4,6 +4,45 @@ from typing import Any
 # ============== System ==============
 BASE_URL = "https://www.v2ph.com"
 AVAILABLE_LANGUAGES = ("zh-Hans", "ja", "zh-Hant", "en", "ko", "es", "fr", "ru", "de", "ar")
+# v2ph only accepts the exact codes in AVAILABLE_LANGUAGES. Anything else
+# (incl. the very common "zh") silently falls back to English on the server,
+# which then poisons every scraped <a href> with ?hl=en. Map the obvious
+# aliases users hand-write in config.yaml / CLI so we don't override their
+# Chinese-locale intent with a bad fallback.
+LANGUAGE_ALIASES: dict[str, str] = {
+    "zh": "zh-Hans",
+    "zh-cn": "zh-Hans",
+    "zh_cn": "zh-Hans",
+    "zh-hans": "zh-Hans",
+    "zh-tw": "zh-Hant",
+    "zh_tw": "zh-Hant",
+    "zh-hk": "zh-Hant",
+    "zh-hant": "zh-Hant",
+    "jp": "ja",
+    "ja-jp": "ja",
+    "kr": "ko",
+    "ko-kr": "ko",
+}
+
+
+def normalize_language(lang: str | None) -> str | None:
+    """Return a canonical v2ph language code or ``None`` if unrecognised.
+
+    Accepts case-insensitive input and the common aliases above. Returns
+    ``None`` for empty / unknown values so callers can decide whether to
+    fall back to a default or skip overriding entirely.
+    """
+    if not lang:
+        return None
+    key = lang.strip().lower()
+    if not key:
+        return None
+    if key in LANGUAGE_ALIASES:
+        return LANGUAGE_ALIASES[key]
+    for canonical in AVAILABLE_LANGUAGES:
+        if canonical.lower() == key:
+            return canonical
+    return None
 VALID_EXTENSIONS = (
     "jpg",
     "jpeg",
@@ -33,11 +72,14 @@ DEFAULT_CHROME_VERSION = "135.0.0.0"
 DEFAULT_USER_AGENT = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{DEFAULT_CHROME_VERSION} Safari/537.36"
 
 
-# For requests to download from the v2ph cdn, somehow the fake_useragent is not working.
+# Headers used by the image downloader against cdn.v2ph.com. The Accept
+# value MUST be the image MIME list a real Chrome would send when loading
+# an <img>; Cloudflare's bot-management on the CDN penalises requests
+# whose Accept claims text/html while their sec-fetch-dest is "image".
 HEADERS = {
     "User-Agent": DEFAULT_USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "ja;q=0.9,en-US,en;q=0.8",
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     "Referer": "https://www.v2ph.com/",
     "sec-fetch-dest": "image",
     "sec-fetch-mode": "no-cors",

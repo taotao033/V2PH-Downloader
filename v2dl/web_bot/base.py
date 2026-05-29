@@ -9,6 +9,70 @@ from typing import Any
 from v2dl.common import Config, const
 from v2dl.security import AccountManager, KeyManager
 
+# Cloudflare interstitial signal hints. Title fragments that appear in
+# the <title> of the "Just a moment..."-style interstitial across the
+# language variants we've observed in the wild. v2ph appends ``?hl=``
+# to URLs and CF mirrors that locale, so the bot has to recognise more
+# than just English / zh-Hant.
+CF_TITLE_HINTS: tuple[str, ...] = (
+    "Just a moment",
+    "請稍候",  # zh-Hant
+    "请稍候",  # zh-Hans
+    "Verifying you are human",
+    "Verify you are human",
+    "ちょっとお待ちください",  # ja
+    "잠시만 기다리십시오",  # ko
+    "Un moment",  # fr
+    "Un momento",  # es
+    "Einen Moment",  # de
+    "Один момент",  # ru
+)
+
+# Body fragments that show up in the rendered HTML when CF is running
+# the challenge. Only language-specific challenge text is listed -
+# structural markers like ``challenges.cloudflare.com`` or ``cf-chl-``
+# show up on *every* page of a CF-fronted site (preconnect <link>
+# hints, CSP headers, leftover scripts) and therefore produce false
+# positives once the challenge has actually cleared, which loops the
+# auto-click logic forever.
+CF_BODY_HINTS: tuple[str, ...] = (
+    "Checking your browser",
+    "Checking your connection",
+    "Checking if the site connection is secure",
+    "正在进行安全验证",  # zh-Hans
+    "正在進行安全驗證",  # zh-Hant
+    "Verifying you are human",
+    "请验证您是真人",  # zh-Hans
+    "請驗證您是真人",  # zh-Hant
+    # Korean / Japanese / Russian variants are uncommon but harmless
+    # to keep here:
+    "사람인지 확인",
+    "人間であることを確認",
+    "Проверка, человек ли вы",
+)
+
+# Title fragments for the WAF hard block page.
+CF_HARD_BLOCK_TITLE_HINTS: tuple[str, ...] = (
+    "Attention Required! | Cloudflare",
+    "Sorry, you have been blocked",
+)
+
+
+def cf_simple_blocked(title: str | None, html: str | None) -> bool:
+    """Return True when the current page looks like the Cloudflare
+    JS / Turnstile interstitial in any supported language."""
+    t = title or ""
+    h = html or ""
+    if any(hint in t for hint in CF_TITLE_HINTS):
+        return True
+    return any(hint in h for hint in CF_BODY_HINTS)
+
+
+def cf_hard_blocked(title: str | None) -> bool:
+    """Return True when the page is a full WAF hard block."""
+    t = title or ""
+    return any(hint in t for hint in CF_HARD_BLOCK_TITLE_HINTS)
+
 
 class BaseBot(ABC):
     """Abstract base class for bots, defining shared behaviors."""
@@ -85,8 +149,46 @@ class BaseBot(ABC):
         Subclasses should override this to expose the live session so that
         out-of-band downloaders (e.g. httpx) can reuse the authenticated
         session and bypass anti-hotlink / Cloudflare checks on the CDN.
+        Implementations are expected to snapshot cookies across ALL
+        domains, not just the current page, so that cdn.v2ph.com's
+        Cloudflare ``__cf_bm`` / ``cf_clearance`` are included.
         """
         return {}
+
+    def ensure_cdn_warmed(self, url: str) -> bool:
+        """Pre-fetch ``url`` through the browser so Cloudflare emits the
+        per-zone clearance cookies for that hostname.
+
+        cdn.v2ph.com is a different Cloudflare zone than www.v2ph.com -
+        clearing one zone never clears the other. The downloader uses
+        this hook to give the browser a chance to perform the bot-
+        management handshake for the CDN domain before we hand its
+        cookies off to curl-cffi.
+
+        Returns True if the warmup was attempted (or already done).
+        Subclasses should make this idempotent: a per-session "done"
+        flag so subsequent calls are no-ops.
+        """
+        return False
+
+    def browser_fetch(self, url: str) -> tuple[int, bytes] | None:
+        """Synchronously fetch ``url`` through the live browser process.
+
+        Used as the last-resort fallback when curl-cffi cannot clear
+        Cloudflare on cdn.v2ph.com. Implementations should route the
+        request through Chromium's real network stack (e.g. CDP
+        ``Network.loadNetworkResource``) so the TLS fingerprint, cookie
+        jar and proxy all match the same browser that solved the CF
+        challenge in the first place.
+
+        Returns ``(status_code, body_bytes)`` on success, or ``None`` on
+        a CDP / driver-level error. ``status_code == 0`` means the
+        request never made it onto the network.
+
+        Implementations are NOT thread-safe; the caller must serialize
+        access to the browser.
+        """
+        return None
 
     def scroll_page(self) -> None:
         """Simulate human-like scrolling behavior."""

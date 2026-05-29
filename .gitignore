@@ -5,6 +5,7 @@ v2dl_chrome_profile*
 chromedriver
 profile
 safe_house
+data/sync/
 !.vscode
 
 # Byte-compiled / optimized / DLL files

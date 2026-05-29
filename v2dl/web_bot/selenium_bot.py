@@ -1,5 +1,6 @@
 import sys
 import time
+import base64
 import random
 import asyncio
 from datetime import datetime
@@ -20,7 +21,26 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from v2dl.common import BotError
 from v2dl.common.cookies import load_cookies
-from v2dl.web_bot.base import BaseBehavior, BaseBot, BaseScroll
+from v2dl.web_bot.base import (
+    BaseBehavior,
+    BaseBot,
+    BaseScroll,
+    cf_hard_blocked,
+    cf_simple_blocked,
+)
+
+# Optional ONNX-based local OCR for v2ph's 4-character image captcha.
+# Used to auto-solve the captcha a few times before falling back to
+# the manual-input wait loop. Install with ``pip install v2dl[ocr]``
+# or ``pip install ddddocr``. Without it the auto-solve step is just
+# skipped and the user is asked to type the captcha manually.
+try:
+    import ddddocr  # type: ignore[import-not-found]
+
+    _HAS_DDDDOCR = True
+except Exception:
+    ddddocr = None  # type: ignore[assignment]
+    _HAS_DDDDOCR = False
 
 if TYPE_CHECKING:
     from v2dl.common import Config
@@ -47,6 +67,16 @@ class SeleniumBot(BaseBot):
         self.init_driver()
         self.scroller = SelScroll(self.driver, self.config, self.logger)
         self.cloudflare = SelCloudflareHandler(self.driver, self.logger)
+        # Persistent Selenium window handle parked on cdn.v2ph.com once
+        # it has passed Cloudflare. Reused for browser-routed downloads
+        # via fetch() so that the request is first-party / same-origin
+        # to the CDN.
+        self._cdn_window_handle: str | None = None
+        # Lazily-initialised ddddocr instance and an init-failure latch.
+        # We don't load the ONNX model until the first captcha actually
+        # fires (~200 ms warm-up + a few MB of RAM).
+        self._ocr: Any = None
+        self._ocr_init_failed: bool = False
 
     def init_driver(self) -> None:
         self.driver: WebDriver
@@ -74,29 +104,233 @@ class SeleniumBot(BaseBot):
             sys.exit("Unable to start Selenium WebDriver")
 
     def close_driver(self) -> None:
+        if self._cdn_window_handle is not None:
+            try:
+                # Switch to the parked CDN window and close just that
+                # window before quitting the driver. This is cosmetic;
+                # ``driver.quit()`` would close everything anyway, but
+                # being explicit avoids a stray "tab is closing" race
+                # if the user runs with ``terminate: false``.
+                self.driver.switch_to.window(self._cdn_window_handle)
+                self.driver.close()
+            except Exception:
+                pass
+            self._cdn_window_handle = None
         self.driver.quit()
         self.chrome_process.terminate()
 
     def get_cookies(self) -> dict[str, str]:
         """Snapshot the live cookies of the Selenium browser session.
 
-        Mirrors ``DrissionBot.get_cookies`` so the httpx downloader can reuse
-        the authenticated session and bypass Cloudflare hotlink protection
-        on cdn.v2ph.com.
+        Mirrors ``DrissionBot.get_cookies``; uses CDP to read cookies
+        across ALL domains. Selenium's ``driver.get_cookies()`` only
+        returns cookies for the current tab's domain, which leaves
+        cdn.v2ph.com without its own ``__cf_bm`` / ``cf_clearance``
+        and produces 403 "Just a moment..." on the CDN downloads.
         """
+        raw: list[dict[str, Any]] = []
         try:
-            raw = self.driver.get_cookies()
+            # CDP works on Chromium-based drivers and gives us the
+            # entire cookie jar in one shot.
+            cdp_result = self.driver.execute_cdp_cmd("Network.getAllCookies", {})
+            raw = cdp_result.get("cookies", []) if isinstance(cdp_result, dict) else []
         except Exception as e:
-            self.logger.warning("Failed to read browser cookies: %s", e)
-            return {}
+            self.logger.debug("CDP Network.getAllCookies failed (%s); falling back", e)
+            try:
+                raw = list(self.driver.get_cookies() or [])
+            except Exception as e2:
+                self.logger.warning("Failed to read browser cookies: %s", e2)
+                return {}
 
-        cookies: dict[str, str] = {}
-        for item in raw or []:
-            name = item.get("name") if isinstance(item, dict) else None
-            value = item.get("value") if isinstance(item, dict) else None
-            if name and value is not None:
-                cookies[str(name)] = str(value)
-        return cookies
+        preferred_domain = "cdn.v2ph.com"
+        staged: dict[str, tuple[str, str]] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            value = item.get("value")
+            domain = (item.get("domain") or "").lstrip(".")
+            if not name or value is None:
+                continue
+            key = str(name)
+            if key not in staged:
+                staged[key] = (str(domain), str(value))
+            else:
+                current_domain, _ = staged[key]
+                if domain == preferred_domain and current_domain != preferred_domain:
+                    staged[key] = (str(domain), str(value))
+        return {k: v for k, (_, v) in staged.items()}
+
+    def ensure_cdn_warmed(self, url: str) -> bool:
+        """Open ``url`` in a background window and wait for Cloudflare
+        to clear. The window is **kept open** afterwards so
+        ``browser_fetch`` can run ``fetch()`` from it (same-origin to
+        cdn.v2ph.com).
+        """
+        if self._cdn_window_handle is not None:
+            return True
+        if getattr(self, "_cdn_warmed_failed", False):
+            return False
+        if not url:
+            return False
+
+        original_handle: str | None = None
+        new_handle: str | None = None
+        keep_window = False
+        last_ct = ""
+        warmup_timeout = 25.0
+        try:
+            original_handle = self.driver.current_window_handle
+            existing = set(self.driver.window_handles)
+            self.driver.execute_script("window.open(arguments[0], '_blank');", url)
+            for handle in self.driver.window_handles:
+                if handle not in existing:
+                    new_handle = handle
+                    break
+
+            if new_handle is None:
+                self.logger.warning("CDN warmup could not open a new window")
+                self._cdn_warmed_failed = True
+                return False
+
+            self.driver.switch_to.window(new_handle)
+            deadline = time.time() + warmup_timeout
+            while time.time() < deadline:
+                try:
+                    ct = self.driver.execute_script(
+                        "return document.contentType || ''"
+                    )
+                except Exception:
+                    ct = ""
+                last_ct = str(ct or "")
+                if last_ct.lower().startswith("image/"):
+                    time.sleep(0.3)
+                    self._cdn_window_handle = new_handle
+                    keep_window = True
+                    self.logger.info(
+                        "CDN warmup ok (contentType=%s); keeping the "
+                        "window open for browser-routed downloads",
+                        last_ct,
+                    )
+                    return True
+                time.sleep(0.5)
+
+            self.logger.warning(
+                "CDN warmup did not reach an image response within %.0fs "
+                "(last document.contentType=%r). The browser itself "
+                "could not pass Cloudflare for %s; try a different "
+                "VPN exit node or disable the proxy.",
+                warmup_timeout,
+                last_ct,
+                url,
+            )
+            self._cdn_warmed_failed = True
+            return False
+        except Exception as e:
+            self.logger.warning("CDN warmup failed for %s: %s", url, e)
+            return False
+        finally:
+            if new_handle is not None and not keep_window:
+                try:
+                    self.driver.switch_to.window(new_handle)
+                    self.driver.close()
+                except Exception:
+                    pass
+            if original_handle is not None:
+                try:
+                    self.driver.switch_to.window(original_handle)
+                except Exception:
+                    pass
+
+    _CDN_FETCH_JS = """
+const targetUrl = arguments[0];
+const done = arguments[arguments.length - 1];
+(async () => {
+    try {
+        const resp = await fetch(targetUrl, {
+            credentials: 'include',
+            cache: 'default',
+            referrerPolicy: 'strict-origin-when-cross-origin'
+        });
+        const status = resp.status;
+        if (!resp.ok) {
+            done({status: status, ok: false, error: 'http_' + status});
+            return;
+        }
+        const buf = await resp.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        const chunk = 32768;
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += chunk) {
+            bin += String.fromCharCode.apply(
+                null, bytes.subarray(i, i + chunk)
+            );
+        }
+        done({status: status, ok: true, data: btoa(bin)});
+    } catch (e) {
+        done({status: 0, ok: false, error: String(e)});
+    }
+})();
+"""
+
+    def browser_fetch(self, url: str) -> tuple[int, bytes] | None:
+        """Fetch ``url`` via ``fetch()`` inside the parked cdn.v2ph.com
+        window. Same-origin request, so Cloudflare cannot tell our fetch
+        apart from a regular in-page image load.
+
+        Synchronous - the caller must run it in an executor and
+        serialize browser access (the asyncio.Lock in ImageScraper).
+        """
+        if self._cdn_window_handle is None:
+            return None
+
+        original_handle: str | None = None
+        try:
+            try:
+                original_handle = self.driver.current_window_handle
+            except Exception:
+                original_handle = None
+            try:
+                self.driver.switch_to.window(self._cdn_window_handle)
+            except Exception as e:
+                self.logger.debug(
+                    "Lost CDN window handle (%s); will give up on browser_fetch",
+                    e,
+                )
+                self._cdn_window_handle = None
+                return None
+
+            # ``execute_async_script`` requires a script timeout; size it
+            # generously since CDN response + base64 encode can take a
+            # few seconds for big images.
+            self.driver.set_script_timeout(60)
+            result = self.driver.execute_async_script(self._CDN_FETCH_JS, url)
+        except Exception as e:
+            self.logger.debug("browser_fetch failed for %s: %s", url, e)
+            return None
+        finally:
+            if original_handle is not None:
+                try:
+                    self.driver.switch_to.window(original_handle)
+                except Exception:
+                    pass
+
+        if not isinstance(result, dict):
+            return None
+
+        status_code = int(result.get("status", 0) or 0)
+        if result.get("ok") and "data" in result:
+            try:
+                body = base64.b64decode(result["data"])
+            except Exception as e:
+                self.logger.debug("base64 decode failed for %s: %s", url, e)
+                return (status_code, b"")
+            return (status_code, body)
+
+        err = result.get("error")
+        if err:
+            self.logger.debug("browser_fetch JS error for %s: %s", url, err)
+        return (status_code, b"")
 
     async def auto_page_scroll(
         self,
@@ -245,30 +479,258 @@ class SeleniumBot(BaseBot):
             sys.exit("Automated login failed.")
         return False
 
+    # See ``DrissionBot._CAPTCHA_DETECT_JS`` for rationale. Kept in sync
+    # with the DrissionPage variant: primary signal is the unique
+    # ``#album-captcha-form`` / ``#captcha-image`` / ``#captcha_code``
+    # IDs that v2ph reuses across both the legacy inline form and the
+    # newer full-page card, with class fragments and localised heading
+    # text in all 10 languages from the bottom switcher as fallbacks.
+    _CAPTCHA_DETECT_JS = """
+return (function () {
+    try {
+        if (document.querySelector(
+            '#album-captcha-form, #captcha-image, #captcha_code, '
+            + '[class*="captcha-container"], [class*="captcha-box"], '
+            + 'form[action*="captcha"], img[src*="captcha"]'
+        )) return true;
+    } catch (e) {}
+    var bodyText = '';
+    try { bodyText = (document.body && document.body.innerText) || ''; } catch (e) {}
+    var hints = [
+        'Please complete the verification',
+        'captcha verification',
+        '\u8bf7\u5b8c\u6210\u9a8c\u8bc1',
+        '\u9a8c\u8bc1\u7801\u9a8c\u8bc1',
+        '\u8acb\u5b8c\u6210\u9a57\u8b49',
+        '\u9a57\u8b49\u78bc\u9a57\u8b49',
+        '\u8a8d\u8a3c\u3092\u5b8c\u4e86',
+        '\u30ad\u30e3\u30d7\u30c1\u30e3\u8a8d\u8a3c',
+        '\uc778\uc99d\uc744 \uc644\ub8cc',
+        '\uce90\ud2b8\ucc28 \uc778\uc99d',
+        'completa la verificaci\u00f3n',
+        'completa el captcha',
+        'compl\u00e9ter la v\u00e9rification',
+        'compl\u00e9ter le captcha',
+        'schlie\u00dfen Sie die Verifizierung',
+        'Captcha-Verifizierung',
+        '\u043f\u0440\u043e\u0439\u0434\u0438\u0442\u0435 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0443',
+        '\u043a\u0430\u043f\u0447',
+        '\u0625\u0643\u0645\u0627\u0644 \u0627\u0644\u062a\u062d\u0642\u0642',
+    ];
+    for (var i = 0; i < hints.length; i++) {
+        if (bodyText.indexOf(hints[i]) !== -1) return true;
+    }
+    return false;
+})();
+"""
+
+    def _is_image_captcha_page(self) -> bool:
+        """Return True when the current page is v2ph's image-captcha
+        interception, regardless of which layout is served.
+        """
+        try:
+            result = self.driver.execute_script(self._CAPTCHA_DETECT_JS)
+        except Exception:
+            return False
+        return bool(result)
+
+    # See ``DrissionBot._CAPTCHA_AUTO_ATTEMPTS`` for rationale.
+    _CAPTCHA_AUTO_ATTEMPTS = 5
+    _CAPTCHA_SUBMIT_WAIT = 6.0
+
+    def _get_ocr(self) -> Any:
+        """Return a lazily-initialised ``ddddocr.DdddOcr`` instance, or
+        ``None`` if ddddocr isn't installed or initialisation
+        previously failed.
+        """
+        if self._ocr_init_failed or not _HAS_DDDDOCR or ddddocr is None:
+            return None
+        if self._ocr is not None:
+            return self._ocr
+        try:
+            self._ocr = ddddocr.DdddOcr(show_ad=False)
+        except Exception as e:
+            self.logger.warning(
+                "ddddocr failed to initialise (%s) - skipping captcha "
+                "auto-solve and falling back to manual input",
+                e,
+            )
+            self._ocr_init_failed = True
+            return None
+        return self._ocr
+
+    def _read_captcha_image_bytes(self) -> bytes | None:
+        """Pull the bytes of the current captcha image out of the
+        ``<img id="captcha-image" src="data:image/png;base64,...">``
+        tag. Returns ``None`` if the element / src is missing or the
+        base64 decode fails.
+        """
+        try:
+            src = self.driver.execute_script(
+                "var el = document.getElementById('captcha-image'); "
+                "return el ? el.src : '';"
+            )
+        except Exception as e:
+            self.logger.debug("captcha image src read failed: %s", e)
+            return None
+        if not isinstance(src, str) or "," not in src:
+            return None
+        _, _, b64 = src.partition(",")
+        try:
+            return base64.b64decode(b64)
+        except Exception as e:
+            self.logger.debug("captcha image base64 decode failed: %s", e)
+            return None
+
+    def _refresh_captcha_image(self) -> None:
+        """Click the captcha image so v2ph's ``location.reload()``
+        handler fetches a fresh challenge.
+        """
+        try:
+            self.driver.execute_script(
+                "var el = document.getElementById('captcha-image'); "
+                "if (el) el.click();"
+            )
+        except Exception as e:
+            self.logger.debug("captcha image refresh failed: %s", e)
+
+    def _try_auto_solve_captcha_once(self, attempt: int) -> bool:
+        """Run a single OCR-and-submit cycle. Returns True iff the
+        captcha page is no longer present after the attempt.
+        """
+        ocr = self._get_ocr()
+        if ocr is None:
+            return False
+
+        img_bytes = self._read_captcha_image_bytes()
+        if not img_bytes:
+            return False
+
+        try:
+            prediction = ocr.classification(img_bytes)
+        except Exception as e:
+            self.logger.debug("ddddocr inference failed: %s", e)
+            return False
+
+        text = prediction.strip() if isinstance(prediction, str) else ""
+        # v2ph's captcha is always 4 ASCII alphanumeric characters.
+        # If OCR returns punctuation / whitespace / non-ASCII it's
+        # garbage; refresh and skip the submit.
+        if (
+            not text
+            or len(text) < 3
+            or len(text) > 8
+            or not text.isascii()
+            or not text.isalnum()
+        ):
+            self.logger.info(
+                "Captcha auto-solve attempt %d/%d: OCR returned %r, "
+                "refreshing image",
+                attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
+            )
+            self._refresh_captcha_image()
+            time.sleep(random.uniform(0.5, 1.0))
+            return False
+
+        self.logger.info(
+            "Captcha auto-solve attempt %d/%d: submitting OCR prediction %r",
+            attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
+        )
+
+        try:
+            input_field = self.driver.find_element(By.ID, "captcha_code")
+            submit_btn = self.driver.find_element(By.ID, "submit")
+        except NoSuchElementException:
+            self.logger.debug("Captcha input or submit element not found")
+            return False
+
+        try:
+            input_field.clear()
+            SelBehavior.human_like_type(input_field, text)
+            time.sleep(random.uniform(0.2, 0.6))
+            submit_btn.click()
+        except Exception as e:
+            self.logger.debug("Captcha submit failed: %s", e)
+            return False
+
+        deadline = time.time() + self._CAPTCHA_SUBMIT_WAIT
+        while time.time() < deadline:
+            time.sleep(0.4)
+            try:
+                if not self._is_image_captcha_page():
+                    return True
+            except Exception:
+                return True
+        return False
+
     def handle_image_captcha(self) -> bool:
-        """Handle image captcha and waiting for manual input if present."""
-        xpath = '//div[@class="col-md-6 captcha-container card p-3"]'
-        captcha_container = self.driver.find_elements(By.XPATH, xpath)
+        """Detect v2ph's image captcha and clear it.
 
-        if captcha_container:
-            self.logger.info("Image captcha detected - Waiting for manual input")
-
-            while True:
-                try:
-                    current_captcha = self.driver.find_elements(By.XPATH, xpath)
-                    if not current_captcha:
-                        self.logger.info("Captcha completed - continuing process")
-                        break
-
-                    time.sleep(random.uniform(1, 2))
-
-                except Exception:
-                    self.logger.info("Captcha completed - continuing process")
-                    break
-        else:
+        Strategy mirrors :py:meth:`DrissionBot.handle_image_captcha`:
+        try ddddocr-based auto-solve up to
+        :py:attr:`_CAPTCHA_AUTO_ATTEMPTS` times, then fall back to the
+        manual-input wait loop. v2ph reuses the same
+        ``#album-captcha-form`` markup for both the legacy inline
+        layout and the newer full-page card, so the auto-solver works
+        against either unchanged.
+        """
+        if not self._is_image_captcha_page():
             self.logger.debug("No image captcha detected")
+            return True
 
-        return True
+        if _HAS_DDDDOCR:
+            self.logger.info(
+                "Image captcha detected - attempting auto-solve via "
+                "ddddocr (up to %d attempts)",
+                self._CAPTCHA_AUTO_ATTEMPTS,
+            )
+            for attempt in range(1, self._CAPTCHA_AUTO_ATTEMPTS + 1):
+                try:
+                    if self._try_auto_solve_captcha_once(attempt):
+                        self.logger.info(
+                            "Captcha auto-solved on attempt %d - "
+                            "continuing process",
+                            attempt,
+                        )
+                        return True
+                except Exception as e:
+                    self.logger.debug(
+                        "Captcha auto-solve attempt %d errored: %s",
+                        attempt, e,
+                    )
+                try:
+                    if not self._is_image_captcha_page():
+                        self.logger.info(
+                            "Captcha cleared (likely solved manually) - "
+                            "continuing process"
+                        )
+                        return True
+                except Exception:
+                    return True
+
+            self.logger.warning(
+                "Captcha auto-solve gave up after %d attempts - please "
+                "solve the captcha in the opened browser. The download "
+                "will resume automatically once verified.",
+                self._CAPTCHA_AUTO_ATTEMPTS,
+            )
+        else:
+            self.logger.warning(
+                "Image captcha detected - please solve the captcha in "
+                "the opened browser. (Install `ddddocr` for automatic "
+                "solving: `pip install v2dl[ocr]`.) The download will "
+                "resume automatically once verified."
+            )
+
+        while True:
+            try:
+                if not self._is_image_captcha_page():
+                    self.logger.info("Captcha completed - continuing process")
+                    return True
+            except Exception:
+                self.logger.info("Captcha completed - continuing process")
+                return True
+            time.sleep(random.uniform(1.0, 2.0))
 
     def cookies_login(self) -> bool:
         account_info = self.account_manager.read(self.account)
@@ -357,17 +819,36 @@ class SelCloudflareHandler:
         return blocked
 
     def is_simple_blocked(self) -> bool:
-        title_check = any(text in self.driver.title for text in ["請稍候...", "Just a moment..."])
-        page_source_check = "Checking your" in self.driver.page_source
-        return title_check or page_source_check
+        try:
+            title = self.driver.title or ""
+        except Exception:
+            title = ""
+        try:
+            html = self.driver.page_source or ""
+        except Exception:
+            html = ""
+        return cf_simple_blocked(title, html)
 
     def is_hard_block(self) -> bool:
-        is_blocked = "Attention Required! | Cloudflare" in self.driver.title
+        try:
+            title = self.driver.title or ""
+        except Exception:
+            title = ""
+        is_blocked = cf_hard_blocked(title)
         if is_blocked:
             self.logger.warning("Cloudflare hard block detected")
         return is_blocked
 
     def handle_cloudflare_turnstile(self) -> None:
+        """Try to solve the Turnstile interstitial; fall back to
+        waiting for a human if the automated path fails.
+
+        Cloudflare's checkbox sits inside a cross-origin iframe; the
+        long-standing iframe-switch + click trick still works on most
+        builds, but when CF mutates the DOM faster than we can switch
+        we just yield to the user and poll for the page to clear.
+        """
+        auto_solved = False
         try:
             iframe = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((
@@ -381,14 +862,51 @@ class SelCloudflareHandler:
                 EC.element_to_be_clickable((By.ID, "cf-turnstile-response")),
             )
             SelBehavior.human_like_click(self.driver, checkbox)
+            auto_solved = True
 
             if "Select all squares with" in self.driver.page_source:
                 self.solve_image_captcha()
-
-            self.driver.switch_to.default_content()
-            SelBehavior.random_sleep(10, 20)
         except (TimeoutException, NoSuchElementException):
-            self.logger.error("Unable to solve Cloudflare challenge.")
+            self.logger.warning(
+                "Automated Cloudflare turnstile click failed - "
+                "falling back to manual solve"
+            )
+        except NotImplementedError:
+            self.logger.warning(
+                "Cloudflare image captcha requires manual solving"
+            )
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+
+        self._wait_for_clear(timeout=120.0, log_manual_hint=not auto_solved)
+
+    def _wait_for_clear(self, timeout: float = 120.0, log_manual_hint: bool = False) -> bool:
+        """Poll until the Cloudflare interstitial is no longer present
+        or until ``timeout`` elapses; lets a human solve the captcha
+        in the opened browser window."""
+        if log_manual_hint:
+            self.logger.warning(
+                "Cloudflare interstitial is still on screen - please "
+                "click the captcha in the browser within %.0fs. The "
+                "download will resume automatically once verified.",
+                timeout,
+            )
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.is_simple_blocked():
+                self.logger.info("Cloudflare interstitial cleared")
+                return True
+            time.sleep(1.0)
+
+        self.logger.warning(
+            "Cloudflare interstitial did not clear within %.0fs - "
+            "the outer retry loop will re-fetch the URL.",
+            timeout,
+        )
+        return False
 
     def handle_cloudflare_recaptcha(self) -> None:
         try:
