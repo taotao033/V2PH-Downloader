@@ -90,6 +90,39 @@ class DrissionBot(BaseBot):
 
     def init_driver(self) -> None:
         co = ChromiumOptions()
+
+        # --- Anti-fingerprinting baseline -----------------------------
+        # DrissionPage 4.x ships ``--test-type`` in its default
+        # ``ChromiumOptions``. That single flag is sufficient for
+        # Cloudflare's bot-management orchestrate script to flag the
+        # session as automation and refuse to clear the managed
+        # challenge regardless of what we click. Strip it before any
+        # user-supplied args are applied so the user can still
+        # re-enable it explicitly via ``chrome_args`` if they need it.
+        co.remove_argument("--test-type")
+
+        # IMPORTANT: do NOT pass ``--disable-blink-features=
+        # AutomationControlled`` here. From Chrome 130+, that flag is
+        # on Chrome's "sensitive flag" deny-list and triggers a yellow
+        # info-bar at the top of the window ("您使用的不支持的命令行标记...").
+        # That info-bar (a) shrinks the viewport by ~37 CSS px - which
+        # throws off every coordinate the OS-click code computes for
+        # the Turnstile widget - and (b) is itself a strong fingerprint
+        # that CF / Turnstile pick up via parent-frame measurement.
+        # The ``navigator.webdriver`` property is overridden at the
+        # JS level by ``_inject_stealth_scripts`` instead, which is
+        # both undetectable from the page and immune to Chrome's flag
+        # filtering.
+
+        # Disable a few feature flags that bias Chrome toward
+        # automation telemetry / experimental UI which CF heuristics
+        # weigh negatively. Keep this list conservative; aggressive
+        # ``--disable-features`` lists themselves can be a fingerprint.
+        co.set_argument(
+            "--disable-features",
+            "Translate,OptimizationHints,PrivacySandboxSettings4",
+        )
+
         args = self.parse_chrome_args()
         if len(args) > 0:
             for arg in args:
@@ -113,7 +146,92 @@ class DrissionBot(BaseBot):
         self.page.set.scroll.smooth(on_off=True)
         self.page.set.scroll.wait_complete(on_off=True)
 
+        # Inject the stealth patches before any navigation runs so the
+        # very first document the user-agent loads (incl. the CF
+        # interstitial) sees a clean ``navigator.webdriver`` etc.
+        self._inject_stealth_scripts()
+
         self.scroller = DriScroll(self.page, self.config, self.logger)
+
+    def _inject_stealth_scripts(self) -> None:
+        """Patch the most-fingerprinted ``navigator`` / ``window``
+        surfaces *before* every document is created.
+
+        Uses ``Page.addScriptToEvaluateOnNewDocument`` (CDP) which
+        runs the script ahead of any page script, including
+        Cloudflare's challenge orchestrate bundle. Without this:
+
+        * ``navigator.webdriver`` is ``true`` whenever a CDP client
+          (DrissionPage) is attached to Chromium - the loudest single
+          bot signal there is.
+        * ``navigator.plugins`` is empty, which CF cross-checks
+          against the UA: a real desktop Chrome always reports a
+          handful of built-in PDF viewer plugins.
+        * ``window.chrome`` is missing some sub-objects that real
+          Chrome exposes (``runtime``, ``app``, ``csi``,
+          ``loadTimes``); CF's "browser sanity" checks look for them.
+
+        Best-effort: a CDP failure is logged but does not raise so
+        startup still succeeds on Chromium builds where this CDP
+        method is not available.
+        """
+        script = r"""
+        try {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+                configurable: true,
+            });
+        } catch (e) {}
+        try {
+            if (!navigator.languages || navigator.languages.length === 0) {
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['zh-CN', 'zh', 'en'],
+                    configurable: true,
+                });
+            }
+        } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => ([
+                    {name: 'PDF Viewer', filename: 'internal-pdf-viewer'},
+                    {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer'},
+                    {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer'},
+                    {name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer'},
+                    {name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer'},
+                ]),
+                configurable: true,
+            });
+        } catch (e) {}
+        try {
+            if (typeof window.chrome === 'undefined') {
+                window.chrome = {};
+            }
+            if (typeof window.chrome.runtime === 'undefined') {
+                window.chrome.runtime = {};
+            }
+            if (typeof window.chrome.app === 'undefined') {
+                window.chrome.app = {InstallState: {}, RunningState: {}, getDetails: function(){}};
+            }
+            if (typeof window.chrome.csi === 'undefined') {
+                window.chrome.csi = function(){};
+            }
+            if (typeof window.chrome.loadTimes === 'undefined') {
+                window.chrome.loadTimes = function(){};
+            }
+        } catch (e) {}
+        """
+        try:
+            self.page.run_cdp(
+                "Page.addScriptToEvaluateOnNewDocument",
+                source=script,
+            )
+            self.logger.info("Stealth patches installed via CDP addScriptToEvaluateOnNewDocument")
+        except Exception as e:
+            self.logger.warning(
+                "Failed to inject stealth script via CDP (%s); "
+                "Cloudflare managed challenges may not auto-clear",
+                e,
+            )
 
     def close_driver(self) -> None:
         if self._cdn_tab is not None:
@@ -1048,6 +1166,25 @@ class DriCloudflareHandler:
         # yet been drawn under it, so even a perfect click is ignored.
         self.random_sleep(1.0, 1.8)
 
+        # If CF's challenge bundle exposes ``cType: 'managed'`` (a
+        # backend-driven challenge with no visible widget) clicking
+        # anywhere on the page is at best wasted work and at worst an
+        # extra "non-human behaviour" signal. Skip the click loop and
+        # just give CF's background JS time to validate the session.
+        challenge_type = self._detect_cf_challenge_type()
+        if challenge_type == "managed":
+            self.logger.info(
+                "Cloudflare 'managed' challenge detected (cType=managed, "
+                "no widget to click); waiting for CF's background JS to "
+                "validate the session - OS click loop skipped"
+            )
+            self._wait_for_clear(
+                timeout=120.0,
+                log_manual_hint=False,
+                retry_click_every=0.0,
+            )
+            return True
+
         # Try OS-level anchor-based click first - this is the only
         # method that defeats closed-shadow-DOM + isTrusted checks.
         clicked = False
@@ -1077,14 +1214,94 @@ class DriCloudflareHandler:
         )
         return True
 
+    def _detect_cf_challenge_type(self) -> str:
+        """Return CF's self-reported challenge type.
+
+        Cloudflare's interstitial bundle assigns ``window._cf_chl_opt``
+        on the page; its ``cType`` member is one of:
+
+        * ``'managed'``  - fully backend-driven, no widget. The page
+          shows just a heading + spinner; CF validates the browser via
+          JS and HTTP-2/TLS fingerprints. Clicking does nothing.
+        * ``'interactive'`` / ``'jschal'`` / ``'chl_api_*'`` - a
+          Turnstile widget is (or will be) rendered and we should try
+          to click it.
+        * Empty / missing - either CF's bundle hasn't loaded yet or
+          we're not actually on a CF page; treated the same as
+          ``'unknown'``.
+        """
+        try:
+            ctype = self.page.run_js(
+                "return (window._cf_chl_opt && window._cf_chl_opt.cType) || ''"
+            )
+        except Exception:
+            return "unknown"
+        if not ctype:
+            return "unknown"
+        return str(ctype).strip().lower()
+
     def _try_anchor_os_click(self) -> bool:
-        """Find a visible heading on the CF challenge page and
-        OS-click at the offset where CF's widget *visually* sits
-        relative to it. Returns True iff a click was dispatched.
+        """OS-click the Turnstile checkbox.
+
+        Strategy in priority order:
+
+        1. **Widget direct hit** - if the Turnstile iframe / container
+           is in the main DOM, use its real ``viewport_location`` and
+           click 30 CSS px in from its left edge, vertically centred.
+           This is precise to within a couple of pixels.
+        2. **Heading-offset fallback** - if no widget element is
+           reachable from the main document (rare on v2ph; mostly
+           happens on shadow-DOM-only managed challenges, which we
+           now skip earlier anyway), fall back to the legacy
+           "H2 + 70 px" geometry guess.
+
+        Returns True iff a click was dispatched.
         """
         if not _HAS_PYAUTOGUI or pyautogui is None:
             return False
 
+        # --- Priority 1: locate the actual Turnstile widget rect ----
+        for locator in self._TURNSTILE_LOCATORS:
+            try:
+                ele = self.page.ele(locator, timeout=0)
+            except Exception:
+                ele = None
+            if not ele:
+                continue
+            try:
+                loc = ele.rect.viewport_location
+                size = ele.rect.size
+                wx, wy = float(loc[0]), float(loc[1])
+                ww, wh = float(size[0]), float(size[1])
+            except Exception:
+                continue
+            # Reject zero-size matches (hidden <input> etc.) and the
+            # full-page wrappers like ``#challenge-stage`` whose rect
+            # spans the whole viewport - clicking their centre would
+            # land somewhere far above the actual widget.
+            if ww <= 30.0 or wh <= 30.0:
+                continue
+            # Standard Turnstile cards are ~300x65 CSS px. ``#turnstile-
+            # wrapper`` and similar outer containers can be much taller
+            # than the card itself; if so, click ~32 px down from the
+            # top edge (where the checkbox sits in CF's layout) rather
+            # than the geometric centre.
+            click_vx = wx + min(30.0, max(15.0, ww * 0.08))
+            if wh <= 100.0:
+                click_vy = wy + wh / 2.0
+            else:
+                click_vy = wy + 32.0
+
+            self.logger.info(
+                "CF Turnstile widget located via %s at viewport "
+                "(%.0f, %.0f) size %.0fx%.0f; targeting checkbox at "
+                "viewport (%.0f, %.0f)",
+                locator, wx, wy, ww, wh, click_vx, click_vy,
+            )
+            self._log_element_under_viewport_point(click_vx, click_vy)
+            return self._pyautogui_click_viewport(click_vx, click_vy)
+
+        # --- Priority 2: legacy heading-offset geometry guess --------
         anchor = None
         anchor_locator = ""
         anchor_rect: tuple[float, float, float, float] | None = None
@@ -1111,30 +1328,62 @@ class DriCloudflareHandler:
 
         if anchor is None or anchor_rect is None:
             self.logger.info(
-                "No CF heading anchor found; cannot compute widget "
-                "screen position via offset"
+                "No CF widget or heading anchor found; cannot compute "
+                "widget screen position"
             )
             return False
 
         ax, ay, aw, ah = anchor_rect
-        # CF's challenge layout: the Turnstile card sits below the
-        # heading, left-aligned with it. Card height ~65 px, checkbox
-        # icon ~30 px from card left and vertically centred. The gap
-        # between the h2 bottom and card top is roughly one paragraph
-        # of description text (~70-90 px), depending on viewport.
+        # CF's layout: the Turnstile card now sits ~110 CSS px below
+        # the H2 heading bottom (was ~70 in older versions; v2ph's
+        # current interstitial added an extra description line).
+        # Empirically v2ph today places the checkbox row at viewport
+        # y ≈ 325 with the H2 at y=186-216, so an offset of ~110 from
+        # H2 bottom hits the checkbox centre.
         click_vx = ax + 22.0
-        # If this is an h1 (taller), descend further; for h2 less.
         if "h1" in anchor_locator:
-            click_vy = ay + ah + 145.0
+            click_vy = ay + ah + 180.0
         else:
-            click_vy = ay + ah + 70.0
+            click_vy = ay + ah + 110.0
 
         self.logger.info(
-            "CF anchor located via %s at viewport (%.0f, %.0f) size %.0fx%.0f; "
-            "targeting widget at viewport (%.0f, %.0f)",
+            "CF heading anchor (no widget element visible) located via "
+            "%s at viewport (%.0f, %.0f) size %.0fx%.0f; geometry-"
+            "guessing widget at viewport (%.0f, %.0f)",
             anchor_locator, ax, ay, aw, ah, click_vx, click_vy,
         )
+        self._log_element_under_viewport_point(click_vx, click_vy)
         return self._pyautogui_click_viewport(click_vx, click_vy)
+
+    def _log_element_under_viewport_point(
+        self, vx: float, vy: float
+    ) -> None:
+        """Diagnostic: log what DOM element is under the click point.
+
+        Helps tell apart "we clicked the wrong pixel" from "we clicked
+        the right pixel but Turnstile rejected the press". A real
+        click on the checkbox should report something like
+        ``IFRAME#cf-chl-widget-..`` or a child of ``.cf-turnstile``;
+        if it instead reports the body / a heading we know our
+        coordinates are off.
+        """
+        try:
+            info = self.page.run_js(
+                "const el = document.elementFromPoint(arguments[0], arguments[1]); "
+                "if (!el) return 'no-element'; "
+                "return (el.tagName || '?') + "
+                "(el.id ? '#' + el.id : '') + "
+                "(el.className && typeof el.className === 'string' ? "
+                "  '.' + el.className.replace(/\\s+/g, '.') : '');",
+                vx, vy,
+            )
+        except Exception as e:
+            self.logger.debug("elementFromPoint diagnostic failed: %s", e)
+            return
+        self.logger.info(
+            "Element under click target (viewport %.1f, %.1f): %s",
+            vx, vy, info,
+        )
 
     # Standard Chrome top-chrome height (title bar + tab strip +
     # URL bar) in CSS pixels. Used as a fallback when JS-reported
@@ -1144,6 +1393,31 @@ class DriCloudflareHandler:
     # but a non-maximised window can have ~8 px. We treat anything
     # under 30 px as plausible and fall back to 0 otherwise.
     _STANDARD_BORDER_W_CSS: float = 0.0
+
+    def _bring_chromium_to_front(self) -> None:
+        """Best-effort: ensure the Chromium window owning ``self.page``
+        is the foreground window before we synthesise an OS click.
+
+        Without this, ``pyautogui.click()`` will move the mouse to the
+        right physical pixel but Windows may dispatch the resulting
+        click to whatever window is currently on top (Cursor / IDE /
+        terminal), so the Turnstile checkbox never sees the press.
+
+        Uses CDP ``Browser.bringToFront`` which Chromium also routes
+        through Win32 ``SetForegroundWindow``; failure is non-fatal,
+        the click will still be attempted.
+        """
+        try:
+            self.page.run_cdp("Page.bringToFront")
+        except Exception:
+            # ``Page.bringToFront`` is the most universally supported
+            # variant and works on every reasonably modern Chromium;
+            # ``Browser.bringToFront`` exists but isn't always exposed
+            # on the page-target session DrissionPage hands us.
+            try:
+                self.page.run_cdp("Browser.bringToFront")
+            except Exception as e:
+                self.logger.debug("bringToFront failed: %s", e)
 
     def _pyautogui_click_viewport(self, click_vx: float, click_vy: float) -> bool:
         """Translate viewport coordinates ``(click_vx, click_vy)`` to
@@ -1158,9 +1432,19 @@ class DriCloudflareHandler:
         * ``pyautogui`` on Windows uses *physical* pixels when DPI
           aware, but JS values are in *CSS* pixels. We multiply the
           final coordinates by ``devicePixelRatio`` to convert.
+        * Cloudflare's Turnstile fingerprints repeat-click locations:
+          if every retry hits the same physical pixel that's a
+          dead-giveaway for a bot. We therefore add ±6 CSS px of
+          jitter around the requested point on every call.
         """
         if not _HAS_PYAUTOGUI or pyautogui is None:
             return False
+
+        # Bring the Chromium window to the foreground first so that
+        # the click event is routed to it and not to whichever window
+        # currently has focus (IDE, terminal, etc.). Idempotent and
+        # cheap to call on every retry.
+        self._bring_chromium_to_front()
 
         try:
             info = self.page.run_js("""
@@ -1195,37 +1479,84 @@ return {
             self.logger.debug("window info parse failed: %s", e)
             return False
 
-        chrome_h_raw = outer_h - inner_h
-        border_w_raw = (outer_w - inner_w) / 2.0
+        # Bail out fast on obviously broken window state. Chromium
+        # reports outerWidth/outerHeight as a tiny iconified rect
+        # (~160x28) when the OS window is minimized, and Win32 places
+        # such windows at the magic ``(-32000, -32000)`` location.
+        # Either signal means an OS click would land somewhere in
+        # the void - which the recent log shows happening at
+        # ``(-47679, -47436)``.
+        if outer_w < 200.0 or outer_h < 200.0:
+            self.logger.warning(
+                "Browser window appears minimized or torn off "
+                "(outer=%.0fx%.0f); skipping OS click. Restore the "
+                "v2dl Chrome window so it is visible on the primary "
+                "display, then leave it alone while the scrape runs.",
+                outer_w, outer_h,
+            )
+            return False
+        if screen_x < -10000.0 or screen_y < -10000.0:
+            self.logger.warning(
+                "Browser window is iconified (screenX=%.0f, screenY=%.0f); "
+                "skipping OS click until the window is restored.",
+                screen_x, screen_y,
+            )
+            return False
 
-        # Sanity-clamp the chrome height. Anything outside the normal
-        # 60-200 px range almost certainly means DevTools is docked
-        # (or some other JS unit-reporting quirk) - use the standard
-        # value and warn the user.
-        if 60.0 <= chrome_h_raw <= 200.0:
-            chrome_h = chrome_h_raw
+        # ``window.outerWidth`` / ``outerHeight`` on Windows Chrome
+        # with per-monitor-v2 DPI awareness are reported in *physical*
+        # pixels, while ``innerWidth`` / ``innerHeight`` stay in CSS
+        # pixels. Naively subtracting them produces the absurd 405 px
+        # "chrome height" we used to log. Detect the mismatch and use
+        # the dpr-corrected value instead.
+        chrome_h_same_unit = outer_h - inner_h
+        chrome_h_dpr_corrected = outer_h / dpr - inner_h
+        border_w_same_unit = (outer_w - inner_w) / 2.0
+        border_w_dpr_corrected = (outer_w / dpr - inner_w) / 2.0
+
+        # Plausible Chrome top-chrome height range, in CSS px. 30-200
+        # covers maximised windows (~58 CSS without bookmarks bar) up
+        # through tall windows with docked extension toolbars.
+        def _plausible_h(v: float) -> bool:
+            return 30.0 <= v <= 200.0
+
+        if _plausible_h(chrome_h_same_unit):
+            chrome_h = chrome_h_same_unit
             chrome_h_source = "outer-inner"
+        elif _plausible_h(chrome_h_dpr_corrected):
+            chrome_h = chrome_h_dpr_corrected
+            chrome_h_source = "outer-physical-corrected"
         else:
             chrome_h = self._STANDARD_CHROME_H_CSS
             chrome_h_source = "standard-fallback"
             self.logger.warning(
                 "Browser chrome height %.0f px (outer %.0fx%.0f, "
-                "inner %.0fx%.0f, dpr=%.2f) is outside the normal "
-                "60-200 px range. Using %.0f px fallback. Close any "
-                "docked DevTools panel and remove bookmarks/extension "
-                "bars for accurate OS clicks.",
-                chrome_h_raw, outer_w, outer_h, inner_w, inner_h, dpr,
-                chrome_h,
+                "inner %.0fx%.0f, dpr=%.2f) and dpr-corrected %.1f "
+                "are both outside the plausible 30-200 px range. "
+                "Using %.0f px fallback. Close any docked DevTools "
+                "panel and remove bookmarks/extension bars for "
+                "accurate OS clicks.",
+                chrome_h_same_unit, outer_w, outer_h, inner_w, inner_h, dpr,
+                chrome_h_dpr_corrected, chrome_h,
             )
 
-        if 0.0 <= border_w_raw <= 30.0:
-            border_w = border_w_raw
+        if 0.0 <= border_w_same_unit <= 30.0:
+            border_w = border_w_same_unit
+        elif 0.0 <= border_w_dpr_corrected <= 30.0:
+            border_w = border_w_dpr_corrected
         else:
             border_w = self._STANDARD_BORDER_W_CSS
 
+        # Add per-call jitter so that consecutive retries don't hit
+        # the exact same physical pixel - Turnstile flags repeat-pixel
+        # clicks as automation. ±6 CSS px keeps us well within the
+        # Turnstile checkbox (~24 CSS px wide) while looking organic.
+        jitter_vx = random.uniform(-6.0, 6.0)
+        jitter_vy = random.uniform(-5.0, 5.0)
+
         # CSS-pixel coordinate of the click target on the OS desktop.
-        css_x = screen_x + border_w + click_vx
-        css_y = screen_y + chrome_h + click_vy
+        css_x = screen_x + border_w + click_vx + jitter_vx
+        css_y = screen_y + chrome_h + click_vy + jitter_vy
 
         # pyautogui on Windows with per-monitor-v2 DPI awareness uses
         # physical pixels. Scale up by devicePixelRatio.
@@ -1249,18 +1580,61 @@ return {
 
         self.logger.info(
             "Dispatching OS click at physical screen (%d, %d) "
-            "[CSS (%.0f, %.0f) -> phys via dpr=%.2f; window @ (%.0f,%.0f), "
-            "chrome_h=%.0f (%s), border_w=%.0f]",
-            final_x, final_y, css_x, css_y, dpr,
+            "[CSS (%.0f, %.0f), jitter=(%+.1f,%+.1f) -> phys via dpr=%.2f; "
+            "window @ (%.0f,%.0f), chrome_h=%.0f (%s), border_w=%.0f]",
+            final_x, final_y, css_x, css_y, jitter_vx, jitter_vy, dpr,
             screen_x, screen_y, chrome_h, chrome_h_source, border_w,
         )
         try:
+            # First glide to a point slightly off the target
+            # (simulating a human approaching the checkbox), then
+            # finish the move on the actual target. This produces a
+            # non-linear mouse trajectory plus a small hover before
+            # the click - both of which Turnstile uses as positive
+            # human-behaviour signals.
+            try:
+                cur_x, cur_y = pyautogui.position()  # type: ignore[attr-defined]
+            except Exception:
+                cur_x, cur_y = final_x - 100, final_y - 100
+            stage1_x = int(round(final_x + random.uniform(-30, 30)))
+            stage1_y = int(round(final_y + random.uniform(-30, 30)))
+            # If the cursor is already near the target there's no
+            # point in a two-stage move - just go straight to it.
+            if abs(cur_x - final_x) > 40 or abs(cur_y - final_y) > 40:
+                pyautogui.moveTo(  # type: ignore[attr-defined]
+                    stage1_x,
+                    stage1_y,
+                    duration=random.uniform(0.25, 0.5),
+                )
+                time.sleep(random.uniform(0.05, 0.15))
             pyautogui.moveTo(  # type: ignore[attr-defined]
                 final_x,
                 final_y,
-                duration=random.uniform(0.3, 0.7),
+                duration=random.uniform(0.18, 0.35),
             )
-            time.sleep(random.uniform(0.08, 0.2))
+            # Verify the OS actually accepted the move. If pyautogui
+            # is in a DPI-virtualised process or the foreground window
+            # rejected the input, the cursor will be somewhere else
+            # entirely - in that case the upcoming click hits whatever
+            # is under the *real* cursor position, not our target.
+            try:
+                actual_x, actual_y = pyautogui.position()  # type: ignore[attr-defined]
+                if abs(actual_x - final_x) > 3 or abs(actual_y - final_y) > 3:
+                    self.logger.warning(
+                        "Cursor ended up at (%d, %d) instead of (%d, %d) "
+                        "after pyautogui.moveTo - the OS or another "
+                        "process is intercepting input. The Turnstile "
+                        "checkbox will not be clicked.",
+                        actual_x, actual_y, final_x, final_y,
+                    )
+                else:
+                    self.logger.debug(
+                        "Cursor confirmed at (%d, %d) after moveTo",
+                        actual_x, actual_y,
+                    )
+            except Exception:
+                pass
+            time.sleep(random.uniform(0.12, 0.28))
             pyautogui.click()  # type: ignore[attr-defined]
             return True
         except Exception as e:
@@ -1706,22 +2080,39 @@ return {
             )
         deadline = time.time() + timeout
         next_retry = time.time() + retry_click_every if retry_click_every > 0 else float("inf")
+        managed_logged = False
         while time.time() < deadline:
             if not self.is_simple_blocked():
                 self.logger.info("Cloudflare interstitial cleared")
                 return True
             if time.time() >= next_retry:
-                self.logger.debug("Retrying automated turnstile click")
-                # Anchor-based OS click first - the only thing that
-                # works on modern (closed shadow DOM) CF widgets.
-                retried = False
-                if _HAS_PYAUTOGUI:
-                    retried = self._try_anchor_os_click()
-                if not retried:
-                    target, locator = self._find_turnstile_target()
-                    if target is not None:
-                        self._click_turnstile_checkbox(target, locator)
-                next_retry = time.time() + retry_click_every
+                # Re-check cType every retry tick: CF can downgrade
+                # from interactive back to managed (or vice versa)
+                # while the page is sitting on the interstitial. If
+                # we're now on a managed challenge there's nothing
+                # to click, so silently extend the next-retry window
+                # rather than spamming OS clicks into empty space.
+                if self._detect_cf_challenge_type() == "managed":
+                    if not managed_logged:
+                        self.logger.info(
+                            "Challenge re-classified as 'managed' "
+                            "mid-wait; suppressing further OS click "
+                            "retries until clearance or timeout"
+                        )
+                        managed_logged = True
+                    next_retry = time.time() + max(retry_click_every, 5.0)
+                else:
+                    self.logger.debug("Retrying automated turnstile click")
+                    # Anchor-based OS click first - the only thing that
+                    # works on modern (closed shadow DOM) CF widgets.
+                    retried = False
+                    if _HAS_PYAUTOGUI:
+                        retried = self._try_anchor_os_click()
+                    if not retried:
+                        target, locator = self._find_turnstile_target()
+                        if target is not None:
+                            self._click_turnstile_checkbox(target, locator)
+                    next_retry = time.time() + retry_click_every
             time.sleep(1.0)
 
         self.logger.warning(
