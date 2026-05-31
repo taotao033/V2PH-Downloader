@@ -31,6 +31,11 @@ static_config:
   metadata_path: ""
   download_log_path: ""
   system_log_path: ""
+  # Profile DB & avatar dir. Leave empty to auto-derive from download_dir:
+  #   profile_db_path -> <download_dir>/v2ph_profiles.sqlite3
+  #   avatar_dir      -> <download_dir>/_avatars
+  profile_db_path: ""
+  avatar_dir: ""
   chrome_exec_path:
     Linux: "/usr/bin/google-chrome"
     Darwin: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"

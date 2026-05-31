@@ -1,7 +1,10 @@
 import os
 import asyncio
+import json
+import time
 import urllib.request
 from abc import ABC, abstractmethod
+from datetime import datetime
 from mimetypes import guess_extension
 from pathlib import Path
 from typing import Any, Generic
@@ -13,8 +16,66 @@ from pathvalidate import sanitize_filename
 from v2dl.common import Config
 from v2dl.common.const import BASE_URL, HEADERS, IMAGE_PER_PAGE, VALID_EXTENSIONS
 from v2dl.scraper.downloader import DirectoryCache, DownloadPathTool
+from v2dl.scraper.profiles import ActorProfile, AlbumProfile, ProfileExtractor
 from v2dl.scraper.tools import AlbumTracker, DownloadStatus, LogKey, UrlHandler
 from v2dl.scraper.types import AlbumResult, ImageResult, PageResultType
+
+# Hidden JSON sidecar written to each album folder. Records which
+# album_url owns the folder so future runs can detect cross-URL name
+# collisions (two different albums sharing a "title" alt text in the
+# DOM) and route the second one to ``<name> (2)`` / ``(3)`` instead
+# of silently overwriting the first one's images.
+ALBUM_SIDECAR_NAME = ".v2dl_album.json"
+
+
+def _read_album_sidecar(album_dir: Path) -> dict[str, Any] | None:
+    """Read the album sidecar if present, else None.
+
+    Corrupt JSON / unreadable file -> None (treated as if missing).
+    Callers should never trust an unparseable sidecar.
+    """
+    sidecar = album_dir / ALBUM_SIDECAR_NAME
+    if not sidecar.is_file():
+        return None
+    try:
+        return json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_album_sidecar(
+    album_dir: Path,
+    album_url: str,
+    title: str | None,
+) -> None:
+    """Persist (or refresh) the album sidecar that claims ``album_dir``.
+
+    ``first_seen_at`` is preserved if a prior sidecar exists, so the
+    history of when this folder was first created stays intact across
+    re-runs.
+
+    Failures are intentionally swallowed: the sidecar is an
+    optimisation for *future* collision detection, never a hard
+    requirement for the current download to proceed.
+    """
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    existing = _read_album_sidecar(album_dir)
+    first_seen_at = (existing or {}).get("first_seen_at") or now
+
+    payload = {
+        "album_url": album_url,
+        "title": title,
+        "first_seen_at": first_seen_at,
+        "last_updated_at": now,
+    }
+    try:
+        album_dir.mkdir(parents=True, exist_ok=True)
+        (album_dir / ALBUM_SIDECAR_NAME).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 # cdn.v2ph.com is fronted by Cloudflare and now returns 403 (with a
 # "Just a moment..." challenge body) for vanilla httpx requests because the
@@ -169,6 +230,12 @@ class AlbumScraper(BaseScraper[AlbumResult]):
         # slug when grouping downloads. The manager resets this between
         # listings because the strategy instance is shared.
         self.last_display_name: str | None = None
+        # Most recently captured actor profile (only populated when the
+        # listing URL is /actor/<slug>). The manager reads + clears this
+        # after ``scrape_all_pages`` completes so it can persist the
+        # profile and link subsequent album rows to the actor.
+        self.last_actor_profile: ActorProfile | None = None
+        self._last_listing_url: str | None = None
 
     def get_xpath(self) -> str:
         return self.XPATH_ALBUM_LIST
@@ -191,6 +258,20 @@ class AlbumScraper(BaseScraper[AlbumResult]):
                 self.last_display_name = UrlHandler.extract_listing_display_name(tree)
             except Exception:
                 self.last_display_name = None
+
+        # Capture the actor profile once, on the first page of an /actor/
+        # listing. Other listing types (company / category / country /
+        # search) intentionally fall through with ``last_actor_profile``
+        # left as None so the manager doesn't try to upsert them as
+        # actors. Wrapped in a broad ``except`` because profile parsing
+        # is opportunistic - it must never break the album-link scrape.
+        if self.last_actor_profile is None and "/actor/" in url:
+            try:
+                self.last_actor_profile = ProfileExtractor.extract_actor(tree, url)
+                self._last_listing_url = url
+            except Exception as e:
+                self.logger.debug("Actor profile extraction failed for %s: %s", url, e)
+
         page_result.extend([BASE_URL + album_link for album_link in page_links])
         self.logger.info("Found %d albums on page %d", len(page_links), page_num)
 
@@ -229,6 +310,26 @@ class ImageScraper(BaseScraper[ImageResult]):
         # album collected from the same listing (e.g. one actor / one
         # company) ends up grouped together. ``None`` means no grouping.
         self._parent_slug: str | None = None
+        # Album profile of the album currently being scraped (captured
+        # on page 1, read by ``ScrapeManager`` after the album finishes).
+        # Reset by the manager between albums.
+        self.last_album_profile: AlbumProfile | None = None
+        # Successful image download count for the current album,
+        # accumulated across pages so the manager can write an accurate
+        # ``scraped_photo_count`` to the DB. Reset by the manager
+        # between albums.
+        self.last_album_success_count: int = 0
+        # Filesystem destination of the current album (parent dir of
+        # the downloaded images). Captured on page 1 so the manager
+        # can record it even when later pages fail.
+        self.last_album_dest: str | None = None
+        # Resolved (collision-disambiguated) album folder for the
+        # current album. Computed once on page 1 by
+        # ``_resolve_album_dir`` and reused for all subsequent pages
+        # so every image of the same album lands in the same folder
+        # even when the predicted name was already claimed by a
+        # different album_url. Reset by ``reset_album_state``.
+        self._resolved_album_dir: Path | None = None
 
     def set_parent_slug(self, slug: str | None) -> None:
         """Configure (or clear) the per-listing subdirectory under which
@@ -240,6 +341,84 @@ class ImageScraper(BaseScraper[ImageResult]):
         """
         slug = (slug or "").strip()
         self._parent_slug = slug or None
+
+    def reset_album_state(self) -> None:
+        """Clear per-album scratch state (profile / counters / dest).
+
+        Called by ``ScrapeManager`` immediately before each
+        ``scrape_album`` so state from a previous album cannot leak
+        into the current one (the strategy instance is reused across
+        every album in a run).
+        """
+        self.last_album_profile = None
+        self.last_album_success_count = 0
+        self.last_album_dest = None
+        self._resolved_album_dir = None
+
+    def _resolve_album_dir(
+        self,
+        parent_dir: Path,
+        album_name: str,
+        album_url: str,
+    ) -> Path:
+        """Pick a collision-free on-disk folder for ``album_url``.
+
+        Resolution rules (first match wins, evaluated in order):
+
+        1. **Predicted name is free** -> use it. The folder will be
+           created on the first image write; the sidecar is written
+           by the caller right after.
+        2. **Predicted exists with our sidecar** (``album_url``
+           matches) -> reuse. This is the re-run / continuation case.
+        3. **Predicted exists with NO sidecar** -> adopt for the
+           current URL. This is the legacy case (folder created by
+           an older v2dl build that did not write sidecars). First
+           caller wins; the second caller will then see a foreign
+           sidecar at step 4 and bump.
+        4. **Predicted exists with a foreign sidecar** -> bump the
+           suffix (`<name> (2)`, `<name> (3)`, ...) and recheck. The
+           first n in [2..99] that's free or ours wins.
+
+        The defensive 100-attempt cap is there in case a pathological
+        layout (e.g. the user manually created lots of `name (N)`
+        decoy folders) loops forever; we fall back to a timestamped
+        unique name so the download still goes somewhere.
+        """
+        base = sanitize_filename(album_name) or "album"
+        candidate = parent_dir / base
+
+        if not candidate.exists():
+            return candidate
+        sidecar = _read_album_sidecar(candidate)
+        if sidecar is None:
+            return candidate  # legacy adopt
+        if sidecar.get("album_url") == album_url:
+            return candidate  # ours
+
+        # Foreign-owned. Walk numeric suffixes.
+        for n in range(2, 100):
+            bumped_name = sanitize_filename(f"{album_name} ({n})") or f"{base}_{n}"
+            candidate = parent_dir / bumped_name
+            if not candidate.exists():
+                return candidate
+            sidecar = _read_album_sidecar(candidate)
+            if sidecar is None:
+                # Foreign legacy folder at this suffix - keep walking
+                # rather than adopting, because once the predicted
+                # name is foreign-owned we can no longer assume "no
+                # sidecar means it's ours".
+                continue
+            if sidecar.get("album_url") == album_url:
+                return candidate
+
+        # Pathological collision count -> last-resort timestamped name.
+        unique = f"{base}_collision_{int(time.time())}"
+        self.logger.warning(
+            "Album folder name '%s' collided too many times under %s; "
+            "falling back to '%s'.",
+            base, parent_dir, unique,
+        )
+        return parent_dir / unique
 
     def get_xpath(self) -> str:
         return self.XPATH_ALBUM
@@ -655,6 +834,17 @@ class ImageScraper(BaseScraper[ImageResult]):
         alts: list[str] = tree.xpath(self.XPATH_ALTS)
         page_result.extend(zip(page_links, alts, strict=False))
 
+        # Capture the album profile on page 1 (subsequent pages of the
+        # same album re-render the same card, so re-extracting would
+        # be wasted work). Wrapped broadly because parsing failures
+        # must NOT block image downloads - profile capture is a
+        # best-effort feature.
+        if page_num == 1 and self.last_album_profile is None:
+            try:
+                self.last_album_profile = ProfileExtractor.extract_album(tree, url)
+            except Exception as e:
+                self.logger.debug("Album profile extraction failed for %s: %s", url, e)
+
         available_images = self.get_available_images(tree)
         idx = (page_num - 1) * IMAGE_PER_PAGE + 1
 
@@ -668,6 +858,40 @@ class ImageScraper(BaseScraper[ImageResult]):
         # ``DownloadPathTool.get_file_dest`` (only the album name is).
         if self._parent_slug:
             dir_ = str(Path(dir_) / sanitize_filename(self._parent_slug))
+
+        # Resolve the album folder ONCE per album (page 1 wins; later
+        # pages reuse the cached path). This prevents two distinct
+        # album_urls that happen to share the same ``<img alt>``-derived
+        # name from silently overwriting each other - the second album
+        # gets bumped to ``<name> (2)`` based on the sidecar at
+        # ``<name>/.v2dl_album.json``. See ``_resolve_album_dir`` for
+        # the full ruleset.
+        clean_album_url = UrlHandler.remove_query_params(url)
+        if self._resolved_album_dir is None:
+            self._resolved_album_dir = self._resolve_album_dir(
+                Path(dir_), album_name, clean_album_url
+            )
+            try:
+                self._resolved_album_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                self.logger.error(
+                    "Failed to create album dir %s: %s",
+                    self._resolved_album_dir, e,
+                )
+            # Claim the folder for this URL. Title is taken from the
+            # captured profile when available, else falls back to the
+            # alt-derived ``album_name`` so even a profile-extraction
+            # failure still produces a useful sidecar.
+            sidecar_title: str | None = None
+            if self.last_album_profile is not None:
+                sidecar_title = self.last_album_profile.title
+            if not sidecar_title:
+                sidecar_title = album_name
+            _write_album_sidecar(
+                self._resolved_album_dir, clean_album_url, sidecar_title
+            )
+
+        album_dir = self._resolved_album_dir
 
         # Cookies snapshotted from the live browser session in PageScraper.
         # Forwarded so cdn.v2ph.com sees the same authenticated session and
@@ -692,7 +916,12 @@ class ImageScraper(BaseScraper[ImageResult]):
             page_link_ctr += 1
 
             filename = f"{(idx + i):03d}"
-            dest = DownloadPathTool.get_file_dest(dir_, album_name, filename)
+            # Bypass DownloadPathTool.get_file_dest: it would rebuild
+            # the folder path from the (possibly colliding) album_name
+            # and undo the resolution we just did. Build the dest
+            # directly inside the resolved album folder. The downloader
+            # appends the actual extension from the response.
+            dest = album_dir / sanitize_filename(filename)
             download_tasks.append(
                 self.download_file(image_url, dest, cookies=cookies, web_bot=web_bot)
             )
@@ -707,9 +936,19 @@ class ImageScraper(BaseScraper[ImageResult]):
             if failed_downloads > 0:
                 self.logger.warning("Failed to download %d images", failed_downloads)
 
+            # Accumulate per-album success count across pages so the
+            # manager can persist an accurate ``scraped_photo_count``
+            # to the profile DB. Reset by ``reset_album_state``.
+            self.last_album_success_count += successful_downloads
+
         self.logger.info("Found %d images on page %d", len(page_links), page_num)
 
-        destination = download_paths[0].parent if download_paths else Path(dir_) / album_name
+        # Always report the resolved album folder (whether we wrote
+        # any images this page or not - skipped/VIP pages still want
+        # a valid dest for the profile DB row).
+        destination = album_dir
+        if self.last_album_dest is None:
+            self.last_album_dest = str(destination)
 
         album_status = DownloadStatus.VIP if is_VIP else DownloadStatus.OK
         clean_url = UrlHandler.remove_query_params(url)

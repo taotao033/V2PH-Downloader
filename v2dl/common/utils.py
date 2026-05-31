@@ -12,10 +12,20 @@ def check_module_installed() -> None:
 
 
 def count_files(dest: str | Path) -> int:
+    """Count files in ``dest``, excluding hidden / metadata files.
+
+    Files whose name starts with a dot (e.g. the per-album sidecar
+    ``.v2dl_album.json`` or any future metadata) are skipped: real
+    v2ph image filenames are zero-padded indices like ``001.jpg``
+    and never start with a dot, so this filter cannot accidentally
+    drop a real download.
+    """
     path = Path(dest)
     if not path.is_dir():
         raise ValueError(f"The path '{dest}' is not a valid directory.")
-    return len([f for f in path.iterdir() if f.is_file()])
+    return sum(
+        1 for f in path.iterdir() if f.is_file() and not f.name.startswith(".")
+    )
 
 
 def enum_to_string(obj: Any) -> str:

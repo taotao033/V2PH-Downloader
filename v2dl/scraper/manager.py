@@ -1,12 +1,23 @@
+import asyncio
 import re
 from logging import Logger
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic
 
+from pathvalidate import sanitize_filename
+
 from v2dl.common import Config, RuntimeConfig, ScrapeError
+from v2dl.common.utils import count_files
 from v2dl.scraper.core import (
     AlbumScraper,
     BaseScraper,
     ImageScraper,
+)
+from v2dl.scraper.downloader import DownloadPathTool
+from v2dl.scraper.profiles import (
+    ActorProfile,
+    AlbumProfile,
+    ProfileDB,
 )
 from v2dl.scraper.tools import AlbumTracker, DownloadStatus, LogKey, MetadataHandler, UrlHandler
 from v2dl.scraper.types import PageResultType, ScrapeType
@@ -44,6 +55,14 @@ class ScrapeManager:
 
         self.metadata_handler = MetadataHandler(config, self.album_tracker)
         self.processed_urls: set[str] = set()
+
+        # Profile DB (actor / album metadata). Lazily created when the
+        # config supplies a path. ``self._current_actor_id`` is set
+        # while a /actor/ listing is being scraped so that each album
+        # processed inside it can be linked back via FK; cleared once
+        # the listing finishes.
+        self.profile_db: ProfileDB | None = self._init_profile_db()
+        self._current_actor_id: int | None = None
 
     async def start_scraping(self) -> bool:
         """Start scraping based on URL type."""
@@ -108,6 +127,7 @@ class ScrapeManager:
         # instance is shared across all URLs in a sync run).
         if isinstance(strategy, AlbumScraper):
             strategy.last_display_name = None
+            strategy.last_actor_profile = None
         scraper = PageScraper(self.web_bot, strategy, self.logger)
 
         album_links = await scraper.scrape_all_pages(url, target_page)
@@ -132,6 +152,16 @@ class ScrapeManager:
                     parent_slug,
                 )
 
+        # Persist the captured actor profile (if any) BEFORE iterating
+        # over album URLs, so that each album's row can reference the
+        # actor via FK as it's inserted. Avatar download is best-effort
+        # and never blocks album scraping.
+        if isinstance(strategy, AlbumScraper) and strategy.last_actor_profile is not None:
+            await self._persist_actor_profile(
+                strategy.last_actor_profile,
+                image_strategy if isinstance(image_strategy, ImageScraper) else None,
+            )
+
         temp_original_url = self.runtime_config.url
         success_count = 0
         fail_count = 0
@@ -155,6 +185,21 @@ class ScrapeManager:
         finally:
             if isinstance(image_strategy, ImageScraper):
                 image_strategy.set_parent_slug(None)
+            # Update the actor's ``scraped_album_count`` once the
+            # listing is fully iterated. Done in ``finally`` so a
+            # mid-listing crash still produces an accurate partial
+            # number.
+            if self.profile_db is not None and self._current_actor_id is not None:
+                try:
+                    self.profile_db.update_actor_scraped_album_count(
+                        self._current_actor_id, success_count
+                    )
+                except Exception as e:
+                    self.logger.debug(
+                        "Failed to persist scraped_album_count for actor_id=%s: %s",
+                        self._current_actor_id, e,
+                    )
+                self._current_actor_id = None
 
         self.logger.info(
             "Album list processing completed: %d successful, %d failed",
@@ -165,17 +210,60 @@ class ScrapeManager:
         self.update_runtime_config(self.runtime_config)
 
     async def scrape_album(self, album_url: str, target_page: int | list[int]) -> None:
-        """Handle scraping of a single album page."""
+        """Handle scraping of a single album page.
+
+        Three modes:
+
+        * **Normal** - URL not in ``downloaded_albums.txt``: fetch all
+          pages and download images.
+        * **Already downloaded + profile already in DB**: full skip.
+        * **Already downloaded + profile NOT yet in DB**: cheap
+          *profile-only backfill* - fetch only page 1 to capture the
+          album card, count files already on disk for
+          ``scraped_photo_count``, then upsert. This closes the gap
+          where a user with a populated ``downloaded_albums.txt``
+          (from earlier runs that pre-date the profile DB) would
+          otherwise have their old albums permanently absent from
+          ``v2ph_profiles.sqlite3``.
+        """
         clean_url = UrlHandler.remove_query_params(album_url)
-        if (
+        already_downloaded = (
             self.album_tracker.is_downloaded(clean_url)
             and not self.config.static_config.force_download
-        ):
-            self.logger.info("Album %s already downloaded, skipping.", album_url)
+        )
+
+        if already_downloaded:
+            # No DB configured -> classic skip behaviour (no backfill
+            # to perform).
+            if self.profile_db is None:
+                self.logger.info("Album %s already downloaded, skipping.", album_url)
+                return
+            try:
+                existing = self.profile_db.get_album_by_url(clean_url)
+            except Exception as e:
+                self.logger.debug("Profile DB lookup failed for %s: %s", clean_url, e)
+                existing = None
+            if existing is not None:
+                self.logger.info(
+                    "Album %s already downloaded and profile recorded, skipping.",
+                    album_url,
+                )
+                return
+            self.logger.info(
+                "Album %s already downloaded but profile not yet recorded - "
+                "fetching page 1 only to backfill profile.",
+                album_url,
+            )
+            await self._backfill_album_profile(album_url, clean_url)
             return
 
         try:
             strategy = self.strategies["album_image"]
+            # Wipe previous album's scratch state (profile / counters /
+            # dest) so it can't bleed into this one. Safe even when
+            # the previous album crashed mid-page.
+            if isinstance(strategy, ImageScraper):
+                strategy.reset_album_state()
             scraper = PageScraper(self.web_bot, strategy, self.logger)
 
             image_links = await scraper.scrape_all_pages(album_url, target_page)
@@ -185,11 +273,25 @@ class ScrapeManager:
             )
             if not image_links:
                 self.logger.warning("No images found for album %s", album_url)
+                # Still upsert the album profile (if captured) so we
+                # have a record that we tried, even if VIP / blocked.
+                if isinstance(strategy, ImageScraper):
+                    self._refresh_album_count_from_disk(strategy)
+                    self._persist_album_profile(strategy, clean_url)
                 return
 
             album_name = re.sub(r"\s*\d+$", "", image_links[0][1]) if image_links else "Unknown Album"
             self.logger.info("Found %d images in album %s", len(image_links), album_name)
             self.album_tracker.log_downloaded(clean_url)
+
+            if isinstance(strategy, ImageScraper):
+                # Prefer ground-truth on-disk file count over the
+                # per-run success accumulator: the two should agree,
+                # but ``count_files`` survives partial reruns where
+                # half the images are cache-hits and half are fresh
+                # downloads.
+                self._refresh_album_count_from_disk(strategy)
+                self._persist_album_profile(strategy, clean_url)
         except Exception as e:
             self.logger.error(
                 "Error scraping album %s: %s. Skipping to next album.",
@@ -202,6 +304,69 @@ class ScrapeManager:
                 {LogKey.status: DownloadStatus.FAIL},
             )
 
+    async def _backfill_album_profile(self, album_url: str, clean_url: str) -> None:
+        """Profile-only backfill for albums already in ``downloaded_albums.txt``.
+
+        We fetch ONLY page 1 of the album because:
+          * The album card (title / release date / models / tags /
+            listed photo count) is identical on every page of the
+            album, so page 1 is sufficient.
+          * Image GETs short-circuit on the file cache anyway, but
+            each *page* fetch still goes through Cloudflare via
+            ``auto_page_scroll`` - those add up fast on a 100-album
+            backlog. Fetching page 1 only gives us a 5-10x speedup
+            over a full-album rescan.
+
+        For ``scraped_photo_count`` we use ``count_files`` on the
+        predicted destination directory (computed by ImageScraper
+        during the page-1 pass) instead of the per-run success
+        counter, since the latter would only see the page-1 cache
+        hits.
+        """
+        strategy = self.strategies["album_image"]
+        if not isinstance(strategy, ImageScraper):
+            return
+        strategy.reset_album_state()
+        scraper = PageScraper(self.web_bot, strategy, self.logger)
+        try:
+            await scraper.scrape_all_pages(album_url, [1])
+        except Exception as e:
+            self.logger.warning("Profile backfill for %s failed: %s.", album_url, e)
+            return
+
+        if strategy.last_album_profile is None:
+            self.logger.warning(
+                "Profile backfill for %s captured no profile (page may be "
+                "VIP / login-redirected / layout-changed).",
+                album_url,
+            )
+            return
+
+        self._refresh_album_count_from_disk(strategy)
+        self._persist_album_profile(strategy, clean_url)
+
+    @staticmethod
+    def _refresh_album_count_from_disk(strategy: ImageScraper) -> None:
+        """Set ``last_album_success_count`` from the actual file count.
+
+        Replaces the per-run accumulator with whatever the filesystem
+        currently shows in ``last_album_dest``. This is the user-
+        meaningful "actually got these many files" number that ends
+        up in ``albums.scraped_photo_count``.
+        """
+        dest = strategy.last_album_dest
+        if not dest:
+            return
+        try:
+            dest_path = Path(dest)
+            if dest_path.is_dir():
+                strategy.last_album_success_count = count_files(dest_path)
+        except Exception:
+            # Stay quiet: a missing dir just means no images on disk
+            # yet (e.g. profile was captured but VIP-blocked the
+            # downloads).
+            pass
+
     def update_runtime_config(self, runtime_config: RuntimeConfig) -> None:
         if not isinstance(runtime_config, RuntimeConfig):
             raise TypeError(f"Expected a RuntimeConfig object, got {type(runtime_config).__name__}")
@@ -209,6 +374,166 @@ class ScrapeManager:
 
         for strategy in self.strategies.values():
             strategy.runtime_config = runtime_config
+
+    # ------------------------------------------------------------------ #
+    # Profile DB helpers
+    # ------------------------------------------------------------------ #
+    def _init_profile_db(self) -> ProfileDB | None:
+        """Open the profile DB if a path is configured, else return None.
+
+        Failures are non-fatal: profile collection is opportunistic, and
+        the user can always still scrape images. We just log and move
+        on.
+        """
+        path = (self.config.static_config.profile_db_path or "").strip()
+        if not path:
+            return None
+        try:
+            return ProfileDB(path)
+        except Exception as e:
+            self.logger.warning(
+                "Failed to open profile DB at %s (%s); profile collection disabled.",
+                path, e,
+            )
+            return None
+
+    async def _persist_actor_profile(
+        self,
+        actor: ActorProfile,
+        image_strategy: ImageScraper | None,
+    ) -> None:
+        """Persist an actor profile and (best-effort) download the avatar.
+
+        ``self._current_actor_id`` is set to the inserted PK so each
+        album processed inside the listing can FK back to it. Avatar
+        download routes through the same browser/curl-cffi pipeline
+        that ``ImageScraper`` uses for album images, so it benefits
+        from the same Cloudflare bypass.
+        """
+        if self.profile_db is None:
+            return
+        try:
+            actor_id = self.profile_db.upsert_actor(actor)
+        except Exception as e:
+            self.logger.warning("Failed to upsert actor profile %s: %s", actor.actor_url, e)
+            return
+
+        self._current_actor_id = actor_id
+        self.logger.info(
+            "Captured actor profile: %s (id=%d, listed_albums=%s)",
+            actor.name or actor.actor_slug or actor.actor_url,
+            actor_id,
+            actor.listed_album_count,
+        )
+
+        if not actor.avatar_url or image_strategy is None:
+            return
+
+        avatar_path = self._avatar_dest_for(actor)
+        if avatar_path is None:
+            return
+        try:
+            cookies = self.web_bot.get_cookies()
+        except Exception:
+            cookies = {}
+        try:
+            ok = await image_strategy.download_file(
+                actor.avatar_url,
+                avatar_path,
+                cookies=cookies,
+                web_bot=self.web_bot,
+            )
+        except Exception as e:
+            self.logger.debug("Avatar download raised for %s: %s", actor.actor_url, e)
+            ok = False
+
+        if ok:
+            # ``download_file`` rewrites the suffix based on the actual
+            # MIME type, so the file on disk may not match
+            # ``avatar_path``. Look up whatever variant was written.
+            actual = self._find_written_file(avatar_path)
+            if actual is not None:
+                try:
+                    self.profile_db.update_actor_avatar_path(actor_id, str(actual))
+                except Exception as e:
+                    self.logger.debug("Failed to record avatar path: %s", e)
+        else:
+            self.logger.info(
+                "Avatar download failed for %s; profile row still saved.",
+                actor.actor_url,
+            )
+
+    def _avatar_dest_for(self, actor: ActorProfile) -> Path | None:
+        """Build a sanitised filesystem path for the actor's avatar.
+
+        Falls back to ``<download_dir>/_avatars`` when the dedicated
+        ``avatar_dir`` is not set. The slug is sanitised because
+        users have actor pages whose slugs contain forward slashes /
+        spaces (e.g. ``/actor/Some Name``).
+        """
+        avatar_dir = (self.config.static_config.avatar_dir or "").strip()
+        if not avatar_dir:
+            avatar_dir = str(Path(self.config.static_config.download_dir or "") / "_avatars")
+        if not avatar_dir or avatar_dir == "_avatars":
+            return None
+
+        slug = actor.actor_slug or actor.name or "actor"
+        safe = sanitize_filename(slug) or "actor"
+        # Suffix is provisional: ``ImageScraper.download_file`` rewrites
+        # it based on the response Content-Type / URL extension. We
+        # pass ``.jpg`` as a placeholder so the parent dir is created
+        # correctly.
+        dest = Path(avatar_dir) / f"{safe}.jpg"
+        try:
+            DownloadPathTool.mkdir(dest.parent)
+        except Exception as e:
+            self.logger.debug("Failed to create avatar dir %s: %s", dest.parent, e)
+            return None
+        return dest
+
+    @staticmethod
+    def _find_written_file(reference: Path) -> Path | None:
+        """Find whichever extension variant of ``reference`` exists on disk.
+
+        ``ImageScraper.download_file`` re-suffixes based on the actual
+        response (e.g. .jpg -> .png), so the post-download path may
+        differ from what we supplied. We just glob the directory for
+        anything sharing the stem.
+        """
+        if reference.exists():
+            return reference
+        try:
+            for sibling in reference.parent.glob(f"{reference.stem}.*"):
+                if sibling.is_file():
+                    return sibling
+        except Exception:
+            return None
+        return None
+
+    def _persist_album_profile(self, strategy: ImageScraper, clean_url: str) -> None:
+        """Upsert the captured album profile + counts to the profile DB."""
+        if self.profile_db is None:
+            return
+        profile = strategy.last_album_profile
+        if profile is None:
+            return
+
+        profile.actor_id = self._current_actor_id
+        profile.scraped_photo_count = strategy.last_album_success_count
+        profile.download_dest = strategy.last_album_dest
+        try:
+            album_id = self.profile_db.upsert_album(profile)
+            self.logger.info(
+                "Persisted album profile: %s (id=%d, scraped=%d/%s, models=%d, tags=%d)",
+                profile.title or profile.album_slug or profile.album_url,
+                album_id,
+                profile.scraped_photo_count,
+                profile.listed_photo_count,
+                len(profile.models),
+                len(profile.tags),
+            )
+        except Exception as e:
+            self.logger.warning("Failed to upsert album profile %s: %s", clean_url, e)
 
     def log_final_status(self) -> None:
         download_status = self.album_tracker.get_download_status

@@ -434,6 +434,41 @@ class UrlHandler:
         " | v2ph",
     )
 
+    # AFTER the site brand is stripped, an /actor/ /company/ /category/
+    # title still has a generic descriptor block tacked onto the entity
+    # name, e.g. "田中美久 、 Miku Tanaka高清写真与个人资料". Without
+    # stripping this, the per-listing subdirectory under download_dir
+    # ends up named "<actor>高清写真与个人资料/<album>/...". We strip
+    # explicit known suffixes first (cheap, predictable), then fall
+    # back to a regex that drops anything starting at "高清..." /
+    # "高解像度..." / "高解像写真..." through end-of-string. The
+    # regex catches future v2ph wording tweaks (e.g. they might add
+    # "高清写真套图" or similar) without having to enumerate every
+    # variant. ``re.search(... + r"$")`` anchors to end so an entity
+    # name that legitimately contains "高清" (rare for actors / brands
+    # but theoretically possible) is preserved unless the descriptor
+    # is literally the trailing portion of the title.
+    _TITLE_DESCRIPTOR_SUFFIXES: ClassVar[tuple[str, ...]] = (
+        "高清写真与个人资料",   # actor - zh-Hans (verified)
+        "高清寫真與個人資料",   # actor - zh-Hant
+        "高清写真合集",          # company / category - zh-Hans
+        "高清寫真合集",          # company / category - zh-Hant
+        "高清写真集",            # short variant
+        "高清寫真集",
+        " High-Resolution Photos and Profile",   # en (probable)
+        " Photos and Profile",                    # en loose
+        " photo collection",                      # en loose
+    )
+    # Last-resort regex: strip "高清..." / "高解像度..." trailing block.
+    # ``[^\-|—]*$`` ensures we don't reach across a separator (after
+    # the brand has been stripped there shouldn't be one, but be
+    # defensive against future title tweaks).
+    _TITLE_DESCRIPTOR_REGEXES: ClassVar[tuple[str, ...]] = (
+        r"高清[^\-|—]*$",
+        r"高解像度[^\-|—]*$",
+        r"高解像[^\-|—]*$",
+    )
+
     @classmethod
     def extract_listing_display_name(cls, tree: html.HtmlElement) -> str | None:
         """Best-effort extraction of the visible name of the current listing.
@@ -473,6 +508,20 @@ class UrlHandler:
                 for sep in (" - ", " | ", " — "):
                     if sep in title:
                         title = title.rsplit(sep, 1)[0].strip()
+                        break
+            # Strip the generic "<entity name>高清写真与个人资料"
+            # descriptor block that v2ph appends to /actor/ /company/
+            # /category/ titles. Try literal known suffixes first, then
+            # a regex catch-all for unforeseen variants.
+            for desc in cls._TITLE_DESCRIPTOR_SUFFIXES:
+                if title.endswith(desc):
+                    title = title[: -len(desc)].strip()
+                    break
+            else:
+                for pattern in cls._TITLE_DESCRIPTOR_REGEXES:
+                    new_title = re.sub(pattern, "", title).strip()
+                    if new_title and new_title != title:
+                        title = new_title
                         break
             # Drop trailing "第N页" / "Page N" decorations sometimes added by
             # paginated listings so multi-page scrapes don't produce a

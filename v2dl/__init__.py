@@ -9,6 +9,7 @@ if sys.version_info < (3, 10):
 import atexit
 import asyncio
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
 
 from v2dl import cli, common, scraper, security, version, web_bot
@@ -203,6 +204,18 @@ class V2DLApp:
         if not sub_dict["chrome_profile_path"]:
             path = str(config_dir / "v2dl_chrome_profile")
             cset(section, "chrome_profile_path", path)
+
+        # Profile DB / avatar dir: derive from download_dir when not set
+        # (config.yaml leaves both empty by default). Resolved AFTER
+        # ``download_dir`` so the substitution always sees the final
+        # value.
+        download_root = self.config_manager.get(section, "download_dir") or ""
+        if not sub_dict.get("profile_db_path"):
+            cset(section, "profile_db_path", str(Path(download_root) / "v2ph_profiles.sqlite3")
+                 if download_root else "")
+        if not sub_dict.get("avatar_dir"):
+            cset(section, "avatar_dir", str(Path(download_root) / "_avatars")
+                 if download_root else "")
 
         # =============== runtime config ===============
         section = "runtime_config"

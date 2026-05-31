@@ -10,10 +10,15 @@ V2PH-Downloader 的本地归档辅助脚本。
 
 ## 文件一览
 
-| 文件              | 作用                                                                       |
-| ----------------- | -------------------------------------------------------------------------- |
-| `sync_local.py`   | 主管道：`discover`（构建监视列表） + `sync`（驱动 v2dl 下载）              |
-| `v2dl-sync.ps1`   | 给 Windows 任务计划程序用的 PowerShell 薄封装，套在 `sync_local.py` 之上   |
+| 文件                  | 作用                                                                       |
+| --------------------- | -------------------------------------------------------------------------- |
+| `sync_local.py`       | 主管道：`discover`（构建监视列表） + `sync`（驱动 v2dl 下载）              |
+| `v2dl-sync.ps1`       | 给 Windows 任务计划程序用的 PowerShell 薄封装，套在 `sync_local.py` 之上   |
+| `smoke_profiles.py`   | 单元级 smoke：合成 HTML（**镜像真实 v2ph DOM**）→ 解析 → 写入 / 读出 SQLite |
+| `smoke_manager.py`    | 端到端 smoke：用 FakeBot 跑通 `ScrapeManager`，覆盖正常路径 + backfill 路径 |
+| `smoke_real_html.py`  | 拿 `album截图/*.html`（用户在浏览器"另存为"出来的真实页面）做硬断言       |
+| `smoke_listing_name.py` | actor / 机构列表页 display name 抽取的回归用例                             |
+| `smoke_collision.py`  | 同名 album 落盘冲突时的目录消歧（`Album / Album (2)`）回归用例             |
 
 `sync_local.py` 把监视列表写到仓库根目录下的 `data/sync/`（已 gitignore）。
 
@@ -91,6 +96,121 @@ D:\v2ph_archive\
 
 ---
 
+## Profile DB & 头像归档
+
+`v2dl` 在抓相册图片之外，还会**把 actor / album 的卡片信息写进一份 SQLite**，方便之后做关联查询、报表、再加工。
+
+### 落盘位置
+
+| 文件 | 默认路径 | 说明 |
+| --- | --- | --- |
+| Profile DB | `<download_dir>/v2ph_profiles.sqlite3` | 4 张表：`actors` / `albums` / `album_models` / `album_tags` |
+| 头像目录   | `<download_dir>/_avatars/<actor_slug>.<ext>` | actor 主页上方那张自我介绍照片 |
+
+两条路径都可以在 `config.yaml` 单独覆盖；留空就按上面默认派生：
+
+```yaml
+static_config:
+  # 留空 = 自动派生为 <download_dir>/v2ph_profiles.sqlite3 / <download_dir>/_avatars
+  profile_db_path: ""
+  avatar_dir: ""
+```
+
+把 `profile_db_path` 显式设成空字符串可以**关闭** profile 收集（图片下载不受影响）。
+
+### 表结构
+
+```text
+actors       (id, actor_url[unique], actor_slug, name, birthday, height,
+              from_location, zodiac, blood_type, profession, hobbies, bio,
+              listed_album_count, scraped_album_count,
+              avatar_url, avatar_local_path,
+              first_seen_at, last_updated_at)
+
+albums       (id, album_url[unique], album_slug, title, release_date,
+              listed_photo_count, scraped_photo_count,
+              actor_id  --> actors.id  (ON DELETE SET NULL),
+              download_dest,            -- ★ 相册的本地目录路径
+              first_seen_at, last_updated_at)
+
+album_models (album_id --> albums.id  (ON DELETE CASCADE),
+              model_name, model_url,   UNIQUE(album_id, model_name))
+
+album_tags   (album_id --> albums.id  (ON DELETE CASCADE),
+              tag_name,  tag_url,      UNIQUE(album_id, tag_name))
+```
+
+要找某个相册存哪儿，直接 join 就行：
+
+```sql
+SELECT a.name AS actor_name, ab.title, ab.release_date,
+       ab.scraped_photo_count, ab.download_dest, a.avatar_local_path
+FROM   actors a
+JOIN   albums ab ON ab.actor_id = a.id
+WHERE  a.actor_slug = 'Miku-Tanaka';
+```
+
+### 老相册的自动补录（backfill）
+
+`v2dl` 用 `%APPDATA%\v2dl\downloaded_albums.txt` 跳过已经下载过的 album URL。如果你是在装上 profile 收集功能**之前**就已经跑过 v2dl 的老用户，那些老相册的 URL 都在 txt 里、文件也在磁盘上、但 SQLite 里啥都没有。
+
+`scrape_album` 会自动识别这种状态并启动 **profile-only backfill**：
+
+| 状态 | 行为 |
+| --- | --- |
+| 不在 `downloaded_albums.txt` | 正常完整抓取（所有页 + 下图） |
+| 在 txt 且 profile DB 已有记录 | 完全跳过 |
+| **在 txt 但 profile DB 没有记录** | **只抓 page 1** 拿到 album 卡片，`scraped_photo_count` 直接用 `count_files()` 数磁盘上的实际文件 |
+
+这意味着**老用户什么都不用做，把之前抓过的 actor URL 重跑一遍就行**：
+
+```powershell
+# 例：之前已经下载过田中美久的所有相册，现在想把 profile 补到 DB 里
+python -m v2dl --bot drissionpage `
+  "https://www.v2ph.com/actor/Miku-Tanaka?hl=zh-Hans"
+```
+
+actor 主页扫一次（拿 actor profile + 头像），列表里每个 album 也只翻 page 1（拿 album 卡片），跑一遍下来 actor 的全部历史相册都会进库。
+
+如果有些 album 不挂在任何 actor 列表下面（散养 URL），把它们写到一个文本文件里走 url-file 模式即可，同样会触发 backfill：
+
+```powershell
+python -m v2dl --bot drissionpage --url-file my_old_albums.txt
+```
+
+### 用 smoke 脚本快速验证一下
+
+不想动真账号也不想等 Cloudflare，可以直接跑这几个 smoke：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 scripts\smoke_profiles.py     # 解析 + DB 单测
+.\.venv\Scripts\python.exe -X utf8 scripts\smoke_manager.py      # 端到端，含 backfill
+.\.venv\Scripts\python.exe -X utf8 scripts\smoke_listing_name.py # 列表页 display name
+.\.venv\Scripts\python.exe -X utf8 scripts\smoke_collision.py    # 同名 album 目录消歧
+.\.venv\Scripts\python.exe -X utf8 scripts\smoke_real_html.py    # 用真实 HTML 做硬断言
+```
+
+所有 smoke 都把数据写到临时目录、跑完自动清理，不会污染你的 archive。改了 `profiles.py` 或 `manager.py` 之后**至少过一遍** `smoke_manager.py` 与 `smoke_real_html.py`。
+
+#### `smoke_real_html.py` 的特殊性
+
+前 4 个 smoke 用合成的 HTML，写起来快但理论上可能跟真实 v2ph DOM 漂移。`smoke_real_html.py` 直接吃用户在浏览器"另存为"出来的 `album截图/*.html`：当文件存在时**对每个字段做硬断言**（actor 的 13 个字段 + album 的 7 个字段 + models / tags），缺文件时优雅 skip。
+
+> 历史上发现的几个真实漂移：
+> - `bio` 是裸文本节点（不是 `<p>`），最稳的来源是 `<meta name="description">`。
+> - `listed_album_count` 在 `<div class="text-center my-2">已收录 <span>N</span> 套</div>`，不在 `.card` 容器里。
+> - `avatar_url` 用 `<meta property="og:image">` 比依赖 `<img src=>` 抗 lazyload / "另存为"重写都强。
+>
+> 这些都已经在 `ProfileExtractor` 里覆盖到。下次想改 XPath 之前请先跑这个 smoke 看哪条假设是错的。
+
+### 注意事项
+
+- **头像下载会尝试一次但不阻塞**。失败就只在日志里 INFO 一句，profile 行照样写库。
+- **Cloudflare 的关账户风险也适用于 profile 抓取**——backfill 模式虽然只翻 page 1，但仍然走浏览器，跟正常下载一样消耗每天的限额。如果要把上百个老 actor 一次性补录，建议**分批跑**或在两次之间手动间隔一下。
+- `scraped_photo_count` 总是从磁盘文件数计算（不是"本次成功下载数"），所以**重跑会自动修正**，不用担心半路失败留下的脏数据。
+
+---
+
 ## 用 Windows 任务计划程序定时跑
 
 ```powershell
@@ -113,8 +233,9 @@ Register-ScheduledTask -TaskName "v2dl-sync-daily" -Action $action -Trigger $tri
 
 1. **账号配额**：v2ph 每个账号有每日浏览图片的配额。一次性把所有机构都同步会**轻松打爆免费账号**。请有意识地规划（比如只标几家机构为 `是否采集 = 1`），或者接受看到很多 "VIP-only" 占位图。
 2. **Chrome 实例**：`discover` 会短暂地拉起一个 DrissionPage 控制的 Chrome。**不要同时开着用相同 user-profile 的另一个 Chrome 窗口**，否则会因为 profile 被锁而启动失败。
-3. **HTML 布局漂移**：提取逻辑依赖 `/company/<name>` / `/actor/<name>` 这种 href 前缀，加上 `N 套 / 套图 / 部 / 张 / sets` 的正则。如果 v2ph 之后大改了卡片结构，`sync_local.py` 里的 `_extract_listing_entries` / `_extract_paths` 可能要更新——不过此时是**温和退化**而不是炸：`total` 会变空、`name` 会回落到 URL slug，URL 仍然能正确抓到。
+3. **HTML 布局漂移**：提取逻辑依赖 `/company/<name>` / `/actor/<name>` 这种 href 前缀，加上 `N 套 / 套图 / 部 / 张 / sets` 的正则。如果 v2ph 之后大改了卡片结构，`sync_local.py` 里的 `_extract_listing_entries` / `_extract_paths` 可能要更新——不过此时是**温和退化**而不是炸：`total` 会变空、`name` 会回落到 URL slug，URL 仍然能正确抓到。**Profile DB 也是同样的容错风格**：`v2dl/scraper/profiles.py` 里的 label 字典对接不上时只会 INFO 一行 debug，相册照常下载，profile 字段留 NULL。
 4. **遗留的 companies.txt**：如果 `data/sync/companies.xlsx` 不存在但 `data/sync/companies.txt` 还在（老安装留下来的），`sync` 会**透明地回落到那个 txt** 跑老格式。跑一次 `python scripts/sync_local.py discover companies` 就完成迁移到 xlsx 流程了。
+5. **老相册没进 profile DB**：参见上面 [Profile DB & 头像归档 → 老相册的自动补录](#老相册的自动补录backfill) 一节，重跑 actor URL 即可自动补录，不需要新命令。
 
 ---
 
@@ -139,4 +260,6 @@ Register-ScheduledTask -TaskName "v2dl-sync-daily" -Action $action -Trigger $tri
 | 演员列表   | `data/sync/actors.xlsx`     | 否（.gitignore）  |
 | 老格式回落 | `data/sync/companies.txt`、`data/sync/actors.txt` | 否 |
 | 已下载日志 | `%APPDATA%\v2dl\downloaded_albums.txt`（v2dl 配置目录） | 否 |
+| Profile DB | `<download_dir>\v2ph_profiles.sqlite3`（可在 config.yaml 改） | 否 |
+| 头像目录   | `<download_dir>\_avatars\<actor_slug>.<ext>` | 否 |
 | 实际下载   | 你 `--destination` 指定的目录 | 否 |

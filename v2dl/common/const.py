@@ -121,6 +121,13 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
             "Windows": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         },
         "chrome_profile_path": "",
+        # Profile DB / avatar storage. Empty strings here mean "auto-derive
+        # from download_dir at runtime"; set ``profile_db_path`` to a single
+        # space (or any falsy-but-non-empty marker) in config.yaml is NOT
+        # how you disable it - instead, leave it empty and disable by not
+        # using the integrated extractor (planned: dedicated CLI flag).
+        "profile_db_path": "",
+        "avatar_dir": "",
     },
     "runtime_config": {
         "url": "",
