@@ -13,6 +13,7 @@ V2PH-Downloader 的本地归档辅助脚本。
 | 文件                  | 作用                                                                       |
 | --------------------- | -------------------------------------------------------------------------- |
 | `sync_local.py`       | 主管道：`discover`（构建监视列表） + `sync`（驱动 v2dl 下载）              |
+| `sync_actors_profile.py` | 把 `data/sync/actors.xlsx` 里的演员**逐个采集 profile + 头像**入库；已完成的自动跳过。用来"先看脸再挑订阅"。 |
 | `v2dl-sync.ps1`       | 给 Windows 任务计划程序用的 PowerShell 薄封装，套在 `sync_local.py` 之上   |
 | `smoke_profiles.py`   | 单元级 smoke：合成 HTML（**镜像真实 v2ph DOM**）→ 解析 → 写入 / 读出 SQLite |
 | `smoke_manager.py`    | 端到端 smoke：用 FakeBot 跑通 `ScrapeManager`，覆盖正常路径 + backfill 路径 |
@@ -192,6 +193,81 @@ python -m v2dl --bot drissionpage --url-file my_old_albums.txt
 
 所有 smoke 都把数据写到临时目录、跑完自动清理，不会污染你的 archive。改了 `profiles.py` 或 `manager.py` 之后**至少过一遍** `smoke_manager.py` 与 `smoke_real_html.py`。
 
+---
+
+## 用头像挑人：`sync_actors_profile.py`
+
+> **用例**：`discover actors` 给你列出了 v2ph 上**所有**演员（动辄两三千），但你根本不知道哪些是想要的。这个脚本帮你**预先把每个演员的基本信息 + 头像采集进库**，跑完之后在文件管理器里翻 `<destination>\_avatars\` 看脸，把感兴趣的人在 `actors.xlsx` 里勾 `是否采集 = 1`，再走 `sync_local.py sync` 下专辑。
+
+它读 `data/sync/actors.xlsx`，逐行决定该做什么（**不需要 `是否采集` 也能跑——默认采集**所有**行**）：
+
+| DB 中状态 | 行为 |
+| --- | --- |
+| 没有此 actor | **full**：抓 actor 主页 HTML → 解析（13 个字段 + `avatar_url` + 简介）→ upsert → 下头像 → 写 `avatar_local_path` |
+| 有 actor 行，但头像没落盘且 `avatar_url` 已知 | **avatar-only**：跳过 HTML 抓取，**只去 CDN GET 一次头像** —— 用来续传中断的 run |
+| 有 actor 行 + 头像文件存在 | **skip**：完全跳过，不消耗 Cloudflare 配额 |
+| 有 actor 行但 `avatar_url` 和文件都没有 | **full**：上次解析很可能挂了，重抓一次 |
+
+实现上**复用了主下载器的全套基础设施**——不是另起炉灶：
+
+- HTML 抓取走 `V2DLApp.bot.auto_page_scroll`（同一个 DrissionPage / Cloudflare clearance）
+- 头像下载走 `ImageScraper.download_file`，先尝试**已 warmed 的 `cdn.v2ph.com` 标签页**（同源 fetch，绕 CF 最稳），失败回落 curl-cffi / httpx
+- 解析走 `ProfileExtractor.extract_actor`（跟 `smoke_real_html.py` 用同一份）
+- 入库走 `ProfileDB.upsert_actor` / `update_actor_avatar_path`，**与主下载器共享同一份 `v2ph_profiles.sqlite3`**——你之前 v2dl 跑过相册下载顺便存的 actor 行，这里自动 skip 不会重抓
+
+### 快速上手
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+
+# 1) 先看一下 dry-run：会跑多少 full / avatar-only / skip，不动 Chrome / 不写库
+python scripts\sync_actors_profile.py -d "D:\v2ph_archive" --dry-run
+
+# 2) 小批起步——比如先把已有 actor 的"丢头像"全部续传回来（cheap）
+#    + 再带 20 个新人 full fetch
+python scripts\sync_actors_profile.py -d "D:\v2ph_archive" --limit 100
+
+# 3) 翻 D:\v2ph_archive\_avatars\ 看脸，把感兴趣的演员在 actors.xlsx 里
+#    把 是否采集 改成 1，保存。
+
+# 4) 只跑勾过的子集（采集进度会很快——大概率它们已经在 DB 里了）
+python scripts\sync_actors_profile.py -d "D:\v2ph_archive" --only-selected
+
+# 5) 后续就走主管道按演员维度同步专辑
+python scripts\sync_local.py sync --input data\sync\actors.xlsx --destination "D:\v2ph_archive"
+```
+
+### 命令行参数（要点）
+
+| 参数 | 说明 |
+| --- | --- |
+| `-d / --destination` **必填** | 归档根目录。DB 派生为 `<destination>\v2ph_profiles.sqlite3`，头像派生为 `<destination>\_avatars\` |
+| `--db PATH` | 显式指定 DB 路径（覆盖 `--destination` 派生） |
+| `--avatar-dir PATH` | 显式指定头像目录（覆盖 `--destination` 派生） |
+| `--no-avatar` | 不下载头像（仍会把 `avatar_url` 字段存进库，方便日后再补） |
+| `--only-selected` | 只处理 `是否采集 == 1` 的行；默认**处理全部行**（预采集"看脸库"这个用例下，行越全越好） |
+| `--limit N` | 本轮**最多处理** N 个 actor（已 skip 的不算预算）。`--limit` 用满时**优先填 avatar-only 续传**，因为这些不抓 HTML，CF 配额成本几乎为 0 |
+| `--force` | 即使 DB 里完整也重抓一次（`upsert_actor` 走 COALESCE 合并，安全） |
+| `--sleep SEC` | actor 主页**之间**的 sleep（默认 5 秒，沿用 `sync_local.INTER_URL_SLEEP_SECONDS`）。avatar-only 续传**不触发**此 sleep |
+| `--dry-run` | 只分类不执行；不开 Chrome、不写库 |
+
+### 落盘位置
+
+| 文件 | 路径 | 来源 |
+| --- | --- | --- |
+| Profile DB | `<destination>\v2ph_profiles.sqlite3` | `ProfileDB.upsert_actor` |
+| 头像 | `<destination>\_avatars\<actor_slug>.<ext>` | `ImageScraper.download_file`；扩展名按响应 MIME 自动改写（jpg / png / webp …） |
+| `actors` 表的 `avatar_local_path` 字段 | 上面那条头像文件的绝对路径 | `ProfileDB.update_actor_avatar_path` |
+
+跑完之后想批量浏览，文件管理器开**大图标视图**直接看就行；要做更花式的"打勾保存"前端的话，`avatar_local_path` 也已经写库了，自己写小工具读 SQLite 就能拼。
+
+### 注意事项
+
+- **CF 配额是真天花板**。脚本默认 5 秒一次 page fetch，看起来慢——但你试图把 2000+ 个 actor 一次跑完肯定会被拦截。**分多天 / 多次跑**是正常用法，断点续传是设计目标。
+- 如果你某次跑里发现"`Cloudflare interstitial or empty body; skipping`"开始连续刷屏，**立刻 Ctrl-C**，让账户冷静几小时再说，不要硬刚。
+- 头像下载**失败不会丢 profile**——actor 主页那一坨 dt/dd 字段照样写库，只是 `avatar_local_path` 留空，下次跑会自动走 avatar-only 续传路径。
+- 这个脚本和 `python -m v2dl --bot drissionpage <actor_url>` 在写库行为上是**等价的**（都调 `upsert_actor`），区别只是这个脚本**不抓相册列表**。所以你之前用主下载器扫过的 actor，这里会自动 skip 头像那一格补就行。
+
 #### `smoke_real_html.py` 的特殊性
 
 前 4 个 smoke 用合成的 HTML，写起来快但理论上可能跟真实 v2ph DOM 漂移。`smoke_real_html.py` 直接吃用户在浏览器"另存为"出来的 `album截图/*.html`：当文件存在时**对每个字段做硬断言**（actor 的 13 个字段 + album 的 7 个字段 + models / tags），缺文件时优雅 skip。
@@ -247,8 +323,10 @@ Register-ScheduledTask -TaskName "v2dl-sync-daily" -Action $action -Trigger $tri
 2. 在 Excel 里凭兴趣勾选 `是否采集 = 1`（建议先勾 3-5 家试水，看下载量心里有数）。
 3. `sync --destination D:\v2ph_archive --mode incremental` —— 跑一次增量。第一次会下不少，之后跑就只补新增的。
 4. 想按演员订阅了再 `discover actors --only-selected` —— 只跑被你勾选过的机构，速度可接受；翻页是全量的，确保**每个演员都能落到表里**。
-5. 在 actors.xlsx 勾选具体演员，用 `sync --input data/sync/actors.xlsx` 跑演员维度的同步。
-6. 把整套 `sync` 命令塞进 `v2dl-sync.ps1` 用任务计划程序定时跑。
+5. **`sync_actors_profile.py -d D:\v2ph_archive`**（分多天跑，受 CF 配额限制）—— 把每个演员的基本信息 + 头像逐个采集进 `<destination>\_avatars\`，跑完就有了一个"看脸库"。
+6. **翻 `_avatars\` 看脸**，在 `actors.xlsx` 里把感兴趣的演员勾 `是否采集 = 1`，保存。
+7. 用 `sync --input data/sync/actors.xlsx` 跑演员维度的同步，把刚才挑出来的人专辑都下下来。
+8. 把整套 `sync` 命令塞进 `v2dl-sync.ps1` 用任务计划程序定时跑。
 
 ---
 
