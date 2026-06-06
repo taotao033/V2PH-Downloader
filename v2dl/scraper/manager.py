@@ -1,5 +1,6 @@
 import asyncio
 import re
+import shutil
 from logging import Logger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic
@@ -7,17 +8,22 @@ from typing import TYPE_CHECKING, Any, Generic
 from pathvalidate import sanitize_filename
 
 from v2dl.common import Config, RuntimeConfig, ScrapeError
+from v2dl.common.const import VALID_EXTENSIONS
 from v2dl.common.utils import count_files
 from v2dl.scraper.core import (
+    ALBUM_SIDECAR_NAME,
     AlbumScraper,
     BaseScraper,
     ImageScraper,
+    _read_album_sidecar,
+    _write_album_sidecar,
 )
 from v2dl.scraper.downloader import DownloadPathTool
 from v2dl.scraper.profiles import (
     ActorProfile,
     AlbumProfile,
     ProfileDB,
+    ProfileExtractor,
 )
 from v2dl.scraper.tools import AlbumTracker, DownloadStatus, LogKey, MetadataHandler, UrlHandler
 from v2dl.scraper.types import PageResultType, ScrapeType
@@ -191,8 +197,15 @@ class ScrapeManager:
             # number.
             if self.profile_db is not None and self._current_actor_id is not None:
                 try:
+                    # Prefer placement rows (one per album under this
+                    # actor folder) over raw loop iterations so shared
+                    # albums adopted from another listing still count.
+                    placement_count = self.profile_db.count_actor_album_placements(
+                        self._current_actor_id
+                    )
                     self.profile_db.update_actor_scraped_album_count(
-                        self._current_actor_id, success_count
+                        self._current_actor_id,
+                        placement_count if placement_count else success_count,
                     )
                 except Exception as e:
                     self.logger.debug(
@@ -212,24 +225,42 @@ class ScrapeManager:
     async def scrape_album(self, album_url: str, target_page: int | list[int]) -> None:
         """Handle scraping of a single album page.
 
-        Three modes:
+        Skip / adopt policy depends on context:
 
-        * **Normal** - URL not in ``downloaded_albums.txt``: fetch all
-          pages and download images.
-        * **Already downloaded + profile already in DB**: full skip.
-        * **Already downloaded + profile NOT yet in DB**: cheap
-          *profile-only backfill* - fetch only page 1 to capture the
-          album card, count files already on disk for
-          ``scraped_photo_count``, then upsert. This closes the gap
-          where a user with a populated ``downloaded_albums.txt``
-          (from earlier runs that pre-date the profile DB) would
-          otherwise have their old albums permanently absent from
-          ``v2ph_profiles.sqlite3``.
+        * **Actor listing** (``ImageScraper._parent_slug`` set): skip
+          only when the album already has images under *this* actor's
+          subdirectory. If the URL is in ``downloaded_albums.txt`` but
+          lives under another actor, copy the files into this actor's
+          folder instead of skipping (keeps per-actor folder counts
+          aligned with the site listing; each copy is independent).
+        * **Direct album URL** (no parent slug): keep the legacy
+          global skip keyed off ``downloaded_albums.txt`` + profile DB
+          backfill.
         """
         clean_url = UrlHandler.remove_query_params(album_url)
+        strategy = self.strategies["album_image"]
+        force = self.config.static_config.force_download
+        in_actor_listing = (
+            isinstance(strategy, ImageScraper)
+            and bool(strategy._parent_slug)
+            and not force
+        )
+
+        if in_actor_listing:
+            handled = await self._handle_actor_listing_album(
+                album_url, clean_url, strategy, target_page
+            )
+            if handled:
+                return
+            # Missing under this actor (empty foreign source, never
+            # downloaded, etc.) -> fall through to a full scrape below.
+            # Do NOT apply the global downloaded_albums.txt skip gate;
+            # that would defeat the re-scrape we just decided on.
+
         already_downloaded = (
-            self.album_tracker.is_downloaded(clean_url)
-            and not self.config.static_config.force_download
+            not in_actor_listing
+            and self.album_tracker.is_downloaded(clean_url)
+            and not force
         )
 
         if already_downloaded:
@@ -278,6 +309,7 @@ class ScrapeManager:
                 if isinstance(strategy, ImageScraper):
                     self._refresh_album_count_from_disk(strategy)
                     self._persist_album_profile(strategy, clean_url)
+                    self._record_actor_album_placement(strategy, clean_url)
                 return
 
             album_name = re.sub(r"\s*\d+$", "", image_links[0][1]) if image_links else "Unknown Album"
@@ -292,6 +324,7 @@ class ScrapeManager:
                 # downloads.
                 self._refresh_album_count_from_disk(strategy)
                 self._persist_album_profile(strategy, clean_url)
+                self._record_actor_album_placement(strategy, clean_url)
         except Exception as e:
             self.logger.error(
                 "Error scraping album %s: %s. Skipping to next album.",
@@ -303,6 +336,250 @@ class ScrapeManager:
                 clean_url,
                 {LogKey.status: DownloadStatus.FAIL},
             )
+
+    def _actor_listing_root(self, strategy: ImageScraper) -> Path | None:
+        slug = (strategy._parent_slug or "").strip()
+        if not slug:
+            return None
+        return Path(strategy.config.static_config.download_dir) / sanitize_filename(slug)
+
+    def _find_album_folder_for_actor(
+        self, strategy: ImageScraper, clean_url: str
+    ) -> Path | None:
+        """Return the album folder under the current actor listing, if any."""
+        root = self._actor_listing_root(strategy)
+        if root is None or not root.is_dir():
+            if (
+                self.profile_db is not None
+                and self._current_actor_id is not None
+            ):
+                try:
+                    placement = self.profile_db.get_actor_album_placement(
+                        self._current_actor_id, clean_url
+                    )
+                except Exception:
+                    placement = None
+                if placement:
+                    dest = Path(placement["download_dest"])
+                    if dest.is_dir():
+                        return dest
+            return None
+
+        for folder in root.iterdir():
+            if not folder.is_dir():
+                continue
+            sidecar = _read_album_sidecar(folder)
+            if not sidecar:
+                continue
+            sidecar_url = UrlHandler.remove_query_params(
+                str(sidecar.get("album_url") or "")
+            )
+            if sidecar_url == clean_url:
+                return folder
+        return None
+
+    def _album_present_for_current_actor(
+        self, strategy: ImageScraper, clean_url: str
+    ) -> bool:
+        folder = self._find_album_folder_for_actor(strategy, clean_url)
+        if folder is None:
+            return False
+        try:
+            return count_files(folder) > 0
+        except ValueError:
+            return False
+
+    def _lookup_global_album_source(self, clean_url: str) -> Path | None:
+        if self.profile_db is None:
+            return None
+        row = None
+        url_candidates = [clean_url]
+        if clean_url.endswith(".html"):
+            url_candidates.append(clean_url[:-5])
+        else:
+            url_candidates.append(f"{clean_url}.html")
+        for candidate in url_candidates:
+            try:
+                row = self.profile_db.get_album_by_url(candidate)
+            except Exception:
+                row = None
+            if row:
+                break
+        if not row:
+            return None
+        dest = (row.get("download_dest") or "").strip()
+        if not dest:
+            return None
+        path = Path(dest)
+        return path if path.is_dir() else None
+
+    @staticmethod
+    def _mirror_album_files(source_dir: Path, target_dir: Path) -> int:
+        """Copy image files from ``source_dir`` into ``target_dir``.
+
+        Always performs a real file copy (never symlink / hardlink) so
+        each actor listing owns an independent on-disk tree: edits,
+        deletes, or re-downloads under one actor never touch another
+        actor's copy of the same album URL.
+        """
+        target_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for src in sorted(source_dir.iterdir()):
+            if not src.is_file() or src.name.startswith("."):
+                continue
+            if src.name == ALBUM_SIDECAR_NAME:
+                continue
+            if src.suffix.lower().lstrip(".") not in VALID_EXTENSIONS:
+                continue
+            dest = target_dir / src.name
+            if not dest.exists():
+                shutil.copy2(src, dest)
+            copied += 1
+        return copied
+
+    def _record_actor_album_placement(
+        self, strategy: ImageScraper, clean_url: str
+    ) -> None:
+        if (
+            self.profile_db is None
+            or self._current_actor_id is None
+            or not strategy._parent_slug
+        ):
+            return
+        dest = strategy.last_album_dest
+        if not dest:
+            return
+        try:
+            n = count_files(dest)
+        except ValueError:
+            n = strategy.last_album_success_count
+        try:
+            self.profile_db.upsert_actor_album_placement(
+                self._current_actor_id,
+                clean_url,
+                dest,
+                n,
+            )
+        except Exception as e:
+            self.logger.debug(
+                "Failed to record actor album placement for %s: %s",
+                clean_url,
+                e,
+            )
+
+    async def _handle_actor_listing_album(
+        self,
+        album_url: str,
+        clean_url: str,
+        strategy: ImageScraper,
+        target_page: int | list[int],
+    ) -> bool:
+        """Actor-listing skip/adopt path. Returns True when fully handled."""
+        if self._album_present_for_current_actor(strategy, clean_url):
+            folder = self._find_album_folder_for_actor(strategy, clean_url)
+            if folder is not None:
+                strategy.last_album_dest = str(folder)
+                try:
+                    strategy.last_album_success_count = count_files(folder)
+                except ValueError:
+                    pass
+                self._record_actor_album_placement(strategy, clean_url)
+            self.logger.info(
+                "Album %s already present under '%s', skipping.",
+                album_url,
+                strategy._parent_slug,
+            )
+            return True
+
+        if not self.album_tracker.is_downloaded(clean_url):
+            return False
+
+        source_dir = self._lookup_global_album_source(clean_url)
+        if source_dir is not None and count_files(source_dir) > 0:
+            await self._adopt_album_into_actor_listing(
+                album_url, clean_url, strategy, source_dir, target_page
+            )
+            return True
+
+        if source_dir is not None and count_files(source_dir) == 0:
+            self.logger.info(
+                "Album %s is logged as downloaded but the source folder is "
+                "empty (%s); re-scraping for '%s'.",
+                album_url,
+                source_dir,
+                strategy._parent_slug,
+            )
+            return False
+
+        self.logger.info(
+            "Album %s is logged as downloaded but no source folder is known; "
+            "re-scraping for '%s'.",
+            album_url,
+            strategy._parent_slug,
+        )
+        return False
+
+    async def _adopt_album_into_actor_listing(
+        self,
+        album_url: str,
+        clean_url: str,
+        strategy: ImageScraper,
+        source_dir: Path,
+        target_page: int | list[int],
+    ) -> None:
+        """Copy a globally-downloaded album into the current actor folder."""
+        strategy.reset_album_state()
+        try:
+            page_url = UrlHandler.add_page_num(album_url, 1)
+            html_content = await self.web_bot.auto_page_scroll(page_url, page_sleep=0)
+            tree = UrlHandler.parse_html(html_content, self.logger)
+            if tree is not None:
+                strategy.last_album_profile = ProfileExtractor.extract_album(
+                    tree, album_url
+                )
+        except Exception as e:
+            self.logger.warning(
+                "Adopt metadata prefetch (page 1) for %s failed: %s", album_url, e
+            )
+
+        album_name = "album"
+        if strategy.last_album_profile and strategy.last_album_profile.title:
+            album_name = strategy.last_album_profile.title
+        elif self.profile_db is not None:
+            try:
+                row = self.profile_db.get_album_by_url(clean_url)
+            except Exception:
+                row = None
+            if row and row.get("title"):
+                album_name = row["title"]
+
+        listing_root = self._actor_listing_root(strategy)
+        if listing_root is None:
+            return
+
+        target_dir = strategy._resolve_album_dir(listing_root, album_name, clean_url)
+        mirrored = self._mirror_album_files(source_dir, target_dir)
+
+        sidecar_title = album_name
+        if strategy.last_album_profile and strategy.last_album_profile.title:
+            sidecar_title = strategy.last_album_profile.title
+        _write_album_sidecar(target_dir, clean_url, sidecar_title)
+
+        strategy.last_album_dest = str(target_dir)
+        strategy.last_album_success_count = mirrored
+        self.album_tracker.log_downloaded(clean_url)
+
+        if strategy.last_album_profile is not None:
+            self._persist_album_profile(strategy, clean_url)
+        self._record_actor_album_placement(strategy, clean_url)
+
+        self.logger.info(
+            "Adopted album %s into '%s' (%d images copied from %s)",
+            album_url,
+            strategy._parent_slug,
+            mirrored,
+            source_dir,
+        )
 
     async def _backfill_album_profile(self, album_url: str, clean_url: str) -> None:
         """Profile-only backfill for albums already in ``downloaded_albums.txt``.
@@ -344,6 +621,7 @@ class ScrapeManager:
 
         self._refresh_album_count_from_disk(strategy)
         self._persist_album_profile(strategy, clean_url)
+        self._record_actor_album_placement(strategy, clean_url)
 
     @staticmethod
     def _refresh_album_count_from_disk(strategy: ImageScraper) -> None:
@@ -830,7 +1108,8 @@ class PageScraper(Generic[PageResultType]):
                 if has_v2ph_chrome:
                     signals.append(
                         "Album page rendered but contains no "
-                        "<div class='album-photo'> elements and no "
+                        "<div class='album-photo'> / "
+                        "<div class='album-photo-small'> elements and no "
                         "captcha / login / VIP / CF markers. The HTML "
                         "structure may have changed upstream - dumping "
                         "the page so you can grep it / file an issue."

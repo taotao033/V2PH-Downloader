@@ -282,15 +282,24 @@ class ImageScraper(BaseScraper[ImageResult]):
     # v2ph swapped a JS lazyload (URL kept in ``data-src`` until the
     # image scrolled into view) for native ``loading="lazy"`` /
     # ``decoding="async"`` on a real ``src`` attribute, so we now read
-    # ``@src`` directly. Both the wrapper div AND the inner img carry
-    # an ``album-photo`` class, so we match the wrapper as a whole-token
-    # class to avoid picking up unrelated ``album-photo-*`` variants.
-    # The ``http``-starts-with filter excludes the few site assets that
-    # still ship as relative paths (e.g. ``/img/logo-ja.svg``).
-    _XPATH_IMG = (
+    # ``@src`` directly. Two album layouts coexist upstream:
+    #
+    # * Legacy: ``<div class="album-photo"><img src="https://...">``
+    # * Current: ``<div class="album-photo-small"><img class="album-photo" src="https://...">``
+    #
+    # We match each wrapper as a whole-token class (``album-photo`` vs
+    # ``album-photo-small``) so unrelated ``album-photo-*`` variants
+    # are not picked up. The ``http``-starts-with filter excludes site
+    # assets that still ship as relative paths (e.g. ``/img/logo-ja.svg``).
+    _XPATH_IMG_LEGACY = (
         '//div[contains(concat(" ", normalize-space(@class), " "),'
         ' " album-photo ")]/img[starts-with(@src, "http")]'
     )
+    _XPATH_IMG_SMALL = (
+        '//div[contains(concat(" ", normalize-space(@class), " "),'
+        ' " album-photo-small ")]/img[starts-with(@src, "http")]'
+    )
+    _XPATH_IMG = f'({_XPATH_IMG_LEGACY} | {_XPATH_IMG_SMALL})'
     XPATH_ALBUM = f'{_XPATH_IMG}/@src'
     XPATH_ALTS = f'{_XPATH_IMG}/@alt'
     XPATH_VIP = ""
@@ -958,7 +967,12 @@ class ImageScraper(BaseScraper[ImageResult]):
 
     def get_available_images(self, tree: html.HtmlElement) -> list[bool]:
         album_photos = tree.xpath(
+            '('
             '//div[contains(concat(" ", normalize-space(@class), " "),'
             ' " album-photo ")][.//img[starts-with(@src, "http")]]'
+            ' | '
+            '//div[contains(concat(" ", normalize-space(@class), " "),'
+            ' " album-photo-small ")][.//img[starts-with(@src, "http")]]'
+            ')'
         )
         return [True] * len(album_photos)

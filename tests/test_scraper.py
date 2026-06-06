@@ -130,3 +130,65 @@ def test_log_final_status(real_scrape_manager):
     real_scrape_manager.logger.info.assert_any_call(f"{url1}: Download successful")
     real_scrape_manager.logger.error.assert_called_once_with(f"{url2}: Unexpected error")
     real_scrape_manager.logger.warning.assert_called_once_with(f"{url3}: VIP images found")
+
+
+def test_image_scraper_xpath_legacy_layout():
+    html = """
+    <div class="album-photo">
+      <img src="https://cdn.v2ph.com/photos/a.jpg" alt="album 0">
+    </div>
+    <div class="album-photo">
+      <img src="https://cdn.v2ph.com/photos/b.jpg" alt="album 1">
+    </div>
+    """
+    tree = UrlHandler.parse_html(html, logging.getLogger())
+    assert tree is not None
+    from v2dl.scraper.core import ImageScraper
+
+    srcs = tree.xpath(ImageScraper.XPATH_ALBUM)
+    assert srcs == [
+        "https://cdn.v2ph.com/photos/a.jpg",
+        "https://cdn.v2ph.com/photos/b.jpg",
+    ]
+
+
+def test_mirror_album_files_copies_images(tmp_path):
+    from v2dl.scraper.manager import ScrapeManager
+
+    source = tmp_path / "src"
+    target = tmp_path / "dst"
+    source.mkdir()
+    (source / "001.jpg").write_bytes(b"img1")
+    (source / "002.jpg").write_bytes(b"img2")
+    (source / ".v2dl_album.json").write_text("{}", encoding="utf-8")
+
+    n = ScrapeManager._mirror_album_files(source, target)
+    assert n == 2
+    assert (target / "001.jpg").read_bytes() == b"img1"
+    assert (target / "002.jpg").read_bytes() == b"img2"
+
+
+def test_image_scraper_xpath_album_photo_small_layout():
+    html = """
+    <div class="photos-list text-center">
+      <div class="album-photo-small my-2">
+        <img src="https://cdn.v2ph.com/photos/a.jpg"
+             class="img-fluid album-photo d-block mx-auto is-loaded"
+             alt="album 0">
+      </div>
+      <div class="album-photo-small my-2">
+        <img src="https://cdn.v2ph.com/photos/b.jpg"
+             class="img-fluid album-photo d-block mx-auto is-loaded"
+             alt="album 1">
+      </div>
+    </div>
+    """
+    tree = UrlHandler.parse_html(html, logging.getLogger())
+    assert tree is not None
+    from v2dl.scraper.core import ImageScraper
+
+    srcs = tree.xpath(ImageScraper.XPATH_ALBUM)
+    assert srcs == [
+        "https://cdn.v2ph.com/photos/a.jpg",
+        "https://cdn.v2ph.com/photos/b.jpg",
+    ]

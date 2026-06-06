@@ -177,6 +177,26 @@ class ProfileDB:
     CREATE INDEX IF NOT EXISTS idx_albums_actor       ON albums(actor_id);
     CREATE INDEX IF NOT EXISTS idx_album_models_album ON album_models(album_id);
     CREATE INDEX IF NOT EXISTS idx_album_tags_album   ON album_tags(album_id);
+
+    -- Per-actor on-disk placement for shared (multi-model) albums.
+    -- ``albums`` stays one row per URL (canonical metadata); this
+    -- table records which folder under each actor listing owns a
+    -- copy so re-syncing actor B does not skip just because actor A
+    -- downloaded the same URL first.
+    CREATE TABLE IF NOT EXISTS actor_album_placements (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor_id             INTEGER NOT NULL,
+        album_url            TEXT    NOT NULL,
+        download_dest        TEXT    NOT NULL,
+        scraped_photo_count  INTEGER NOT NULL DEFAULT 0,
+        first_seen_at        TEXT    NOT NULL,
+        last_updated_at      TEXT    NOT NULL,
+        UNIQUE (actor_id, album_url),
+        FOREIGN KEY (actor_id) REFERENCES actors(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_actor_album_placements_actor
+        ON actor_album_placements(actor_id);
     """
 
     def __init__(self, db_path: str | Path) -> None:
@@ -401,6 +421,62 @@ class ProfileDB:
                 "SELECT * FROM albums WHERE album_url = ?", (album_url,)
             ).fetchone()
             return dict(row) if row else None
+
+    def get_actor_album_placement(
+        self, actor_id: int, album_url: str
+    ) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM actor_album_placements WHERE actor_id = ? AND album_url = ?",
+                (actor_id, album_url),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def upsert_actor_album_placement(
+        self,
+        actor_id: int,
+        album_url: str,
+        download_dest: str,
+        scraped_photo_count: int,
+    ) -> None:
+        now = _now_iso()
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id FROM actor_album_placements WHERE actor_id = ? AND album_url = ?",
+                (actor_id, album_url),
+            )
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    """
+                    INSERT INTO actor_album_placements (
+                        actor_id, album_url, download_dest,
+                        scraped_photo_count, first_seen_at, last_updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (actor_id, album_url, download_dest, scraped_photo_count, now, now),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE actor_album_placements SET
+                        download_dest = ?,
+                        scraped_photo_count = ?,
+                        last_updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (download_dest, scraped_photo_count, now, int(row["id"])),
+                )
+            conn.commit()
+
+    def count_actor_album_placements(self, actor_id: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM actor_album_placements WHERE actor_id = ?",
+                (actor_id,),
+            ).fetchone()
+            return int(row["n"]) if row else 0
 
 
 def _now_iso() -> str:
