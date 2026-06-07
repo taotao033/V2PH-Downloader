@@ -63,7 +63,9 @@ python scripts/sync_local.py discover actors --only-selected --max-pages-per-com
 
 #    在 actors.xlsx 里把你想下载的演员标 是否采集 = 1，保存，
 #    然后让 sync 跑这份 xlsx 而不是 companies.xlsx：
-python scripts/sync_local.py sync --input data/sync/actors.xlsx --destination "D:\v2ph_archive"
+#    默认--mode incremental  # 只采集第一页（每个演员的最新专辑） albums。 当--mode full 时会翻页采集所有albums。
+#    --force-download       # 即使专辑已经在 downloaded_albums.txt 里了也重抓一次（profile-only backfill 模式）
+python scripts/sync_local.py sync --input data/sync/actors.xlsx --destination "D:\v2ph_archive" --mode full
 ```
 
 **重跑 `discover companies` 不会清掉你的勾选**：脚本按 `url` 列匹配，把已有的「是否采集」原样填回去。所以日 / 周级别地重新跑 discover 来发现新机构是安全的（新加进来的机构默认 0），你之前的订阅集不会被重置。
