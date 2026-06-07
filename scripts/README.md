@@ -63,9 +63,12 @@ python scripts/sync_local.py discover actors --only-selected --max-pages-per-com
 
 #    在 actors.xlsx 里把你想下载的演员标 是否采集 = 1，保存，
 #    然后让 sync 跑这份 xlsx 而不是 companies.xlsx：
-#    默认--mode incremental  # 只采集第一页（每个演员的最新专辑） albums。 当--mode full 时会翻页采集所有albums。
-#    --force-download       # 即使专辑已经在 downloaded_albums.txt 里了也重抓一次（profile-only backfill 模式）
+#    --mode incremental  只翻每个演员列表的第 1 页（补最新专辑，日常够用）
+#    --mode full         翻完该演员的所有列表页（首次全量 / 周级重扫）
 python scripts/sync_local.py sync --input data/sync/actors.xlsx --destination "D:\v2ph_archive" --mode full
+
+# 7)（可选）CDN 中断或部分相册没下完时，智能补漏（见下文「--force-download」）
+python scripts/sync_local.py sync --input data/sync/actors.xlsx --destination "D:\v2ph_archive" --mode full --force-download
 ```
 
 **重跑 `discover companies` 不会清掉你的勾选**：脚本按 `url` 列匹配，把已有的「是否采集」原样填回去。所以日 / 周级别地重新跑 discover 来发现新机构是安全的（新加进来的机构默认 0），你之前的订阅集不会被重置。
@@ -97,6 +100,74 @@ D:\v2ph_archive\
 
 这些上限其实就是 `v2dl` 自己的默认值；这层 wrapper 只是当成硬天花板强制住，避免你某天手抖把 `--max-worker` 拉到 16 去批量跑。
 
+### `sync` 命令行参数（要点）
+
+| 参数 | 说明 |
+| --- | --- |
+| `--input PATH` | 监视列表。默认 `data/sync/companies.xlsx`；按演员维度时用 `data/sync/actors.xlsx` |
+| `--destination PATH` | 归档根目录（传给 `v2dl -d`） |
+| `--mode incremental \| full` | `incremental` = 每个 listing 只翻第 1 页；`full` = 翻完所有列表页 |
+| `--max-worker N` | 单相册并发下载数（硬上限 3，默认 2） |
+| `--rate-limit N` | 单文件限速 kbps（硬上限 2000，默认 1000） |
+| `--force-download` | **智能补漏**：只重试空相册 / 部分下载的相册；已完整的相册仍跳过（详见下文） |
+| `--dry-run` | 只打印将要执行的 `v2dl` 命令，不真正跑 |
+
+> **注意**：`sync_local.py --force-download` **不等于** `v2dl -f` / `--force`。后者会无脑重下所有相册的所有图片；`sync` 里的 `--force-download` 只会补缺失部分，已有图片文件不会重抓。
+
+---
+
+## 按演员同步：相册数量与 skip 策略
+
+用 `sync --input data/sync/actors.xlsx` 时，相册会落在 `<destination>\<演员名>\<相册名>\` 下。目标是**该演员目录里的相册文件夹数与网站列表一致**。
+
+### 两层含义不要混
+
+| 维度 | 作用 | 存储 |
+| --- | --- | --- |
+| **全局 CDN 去重** | 这个 album URL 的图片是否已经从网站拉过 | `%APPDATA%\v2dl\downloaded_albums.txt` |
+| **演员目录完整性** | 这个演员文件夹下是否**有一份**该相册的副本 | 磁盘 sidecar + `actor_album_placements` 表 |
+
+多人合辑（杂志 / DOLCE / FRIDAY 等）会出现在多个演员的列表里。旧逻辑只要 URL 在 `downloaded_albums.txt` 里就全局 skip，导致演员 B 的目录比网站少几本。现在的 actor listing 模式：
+
+| 情况 | 行为 |
+| --- | --- |
+| 该演员目录下已有相册且**有图片** | 跳过 |
+| URL 在 txt 里，但图在**别的演员**目录下 | **复制一份**到当前演员目录（物理 `copy`，互不影响） |
+| 源目录为空（只有 `.v2dl_album.json`）或从未下载 | **重新 scrape** 并下载 |
+| 目录里只有 sidecar、图片数 = 0 | 视为未完成，**重新 scrape** |
+
+判断是否「有图」用 `count_files()`，**自动排除** `.v2dl_album.json`。
+
+### `--force-download`（智能补漏）
+
+传给 v2dl 的 `--retry-incomplete`。适用场景：CDN 403 导致**部分图片**没下完、或历史代码留下空目录。
+
+| 相册状态 | 普通 `sync` | `sync --force-download` |
+| --- | --- | --- |
+| 已完整（磁盘图片数 ≥ `listed_photo_count`） | 跳过 | **仍跳过** |
+| 部分下载（例如 listed=90，实际 60 张） | 跳过（有图即视为完成） | **重新 scrape，只补缺的编号** |
+| 空目录 / 缺失整本相册 | 会补（见上表） | 会补 |
+
+查可疑的部分下载相册：
+
+```sql
+SELECT album_url, title, scraped_photo_count, listed_photo_count, download_dest
+FROM albums
+WHERE listed_photo_count IS NOT NULL
+  AND scraped_photo_count < listed_photo_count;
+```
+
+### CDN 报错时怎么办
+
+图片域 `cdn.v2ph.com` 走 Cloudflare。日志里常见 `HTTP 403`、`CDN warmup failed`、`Failed to download N images`。
+
+1. **保持默认限速**（`--max-worker 2`、`--rate-limit 1000`），不要拉高。
+2. **长时间跑批时分段**：CF 错误连续刷屏时 **Ctrl-C**，冷静几小时再跑。
+3. **一次不要勾太多演员**；用 `actors.xlsx` 的 `是否采集` 控制批量。
+4. **CDN 错误变多后重启一次 sync**（重新起 Chrome / CDN 标签页）；必要时手动打开 v2ph 刷新 cookie。
+5. 网络不稳时换 VPN 节点或试直连；确保已 `pip install curl-cffi`（浏览器 CDN 通道挂掉时的后备）。
+6. 补漏用 `--force-download`，不要用 `v2dl -f`（后者会重下已完整的相册）。
+
 ---
 
 ## Profile DB & 头像归档
@@ -107,7 +178,7 @@ D:\v2ph_archive\
 
 | 文件 | 默认路径 | 说明 |
 | --- | --- | --- |
-| Profile DB | `<download_dir>/v2ph_profiles.sqlite3` | 4 张表：`actors` / `albums` / `album_models` / `album_tags` |
+| Profile DB | `<download_dir>/v2ph_profiles.sqlite3` | 5 张表：`actors` / `albums` / `actor_album_placements` / `album_models` / `album_tags` |
 | 头像目录   | `<download_dir>/_avatars/<actor_slug>.<ext>` | actor 主页上方那张自我介绍照片 |
 
 两条路径都可以在 `config.yaml` 单独覆盖；留空就按上面默认派生：
@@ -141,6 +212,12 @@ album_models (album_id --> albums.id  (ON DELETE CASCADE),
 
 album_tags   (album_id --> albums.id  (ON DELETE CASCADE),
               tag_name,  tag_url,      UNIQUE(album_id, tag_name))
+
+actor_album_placements
+              (actor_id --> actors.id  (ON DELETE CASCADE),
+               album_url, download_dest, scraped_photo_count,
+               UNIQUE(actor_id, album_url))
+              -- 同一 album URL 在每个演员目录下各有一份落盘记录
 ```
 
 要找某个相册存哪儿，直接 join 就行：
@@ -155,15 +232,17 @@ WHERE  a.actor_slug = 'Miku-Tanaka';
 
 ### 老相册的自动补录（backfill）
 
-`v2dl` 用 `%APPDATA%\v2dl\downloaded_albums.txt` 跳过已经下载过的 album URL。如果你是在装上 profile 收集功能**之前**就已经跑过 v2dl 的老用户，那些老相册的 URL 都在 txt 里、文件也在磁盘上、但 SQLite 里啥都没有。
+`v2dl` 用 `%APPDATA%\v2dl\downloaded_albums.txt` 记录「这个 album URL 已从 CDN 拉过图」。如果你是在装上 profile 收集功能**之前**就已经跑过 v2dl 的老用户，那些老相册的 URL 都在 txt 里、文件也在磁盘上、但 SQLite 里啥都没有。
 
-`scrape_album` 会自动识别这种状态并启动 **profile-only backfill**：
+**直接输入单个 album URL**（没有演员 listing 的 `parent_slug`）时，`scrape_album` 走全局 skip + backfill：
 
 | 状态 | 行为 |
 | --- | --- |
 | 不在 `downloaded_albums.txt` | 正常完整抓取（所有页 + 下图） |
 | 在 txt 且 profile DB 已有记录 | 完全跳过 |
 | **在 txt 但 profile DB 没有记录** | **只抓 page 1** 拿到 album 卡片，`scraped_photo_count` 直接用 `count_files()` 数磁盘上的实际文件 |
+
+**通过 `sync --input actors.xlsx` 跑演员列表**时，走上一节的 per-actor 策略（按演员目录判断 skip / 复制 / 重下），不会被「别的演员已经下过这本合辑」误跳过。详见 [按演员同步：相册数量与 skip 策略](#按演员同步相册数量与-skip-策略)。
 
 这意味着**老用户什么都不用做，把之前抓过的 actor URL 重跑一遍就行**：
 
@@ -314,6 +393,8 @@ Register-ScheduledTask -TaskName "v2dl-sync-daily" -Action $action -Trigger $tri
 3. **HTML 布局漂移**：提取逻辑依赖 `/company/<name>` / `/actor/<name>` 这种 href 前缀，加上 `N 套 / 套图 / 部 / 张 / sets` 的正则。如果 v2ph 之后大改了卡片结构，`sync_local.py` 里的 `_extract_listing_entries` / `_extract_paths` 可能要更新——不过此时是**温和退化**而不是炸：`total` 会变空、`name` 会回落到 URL slug，URL 仍然能正确抓到。**Profile DB 也是同样的容错风格**：`v2dl/scraper/profiles.py` 里的 label 字典对接不上时只会 INFO 一行 debug，相册照常下载，profile 字段留 NULL。
 4. **遗留的 companies.txt**：如果 `data/sync/companies.xlsx` 不存在但 `data/sync/companies.txt` 还在（老安装留下来的），`sync` 会**透明地回落到那个 txt** 跑老格式。跑一次 `python scripts/sync_local.py discover companies` 就完成迁移到 xlsx 流程了。
 5. **老相册没进 profile DB**：参见上面 [Profile DB & 头像归档 → 老相册的自动补录](#老相册的自动补录backfill) 一节，重跑 actor URL 即可自动补录，不需要新命令。
+6. **演员目录相册数比网站少**：多半是合辑先被别的演员下过，或历史空目录。普通 `sync --mode full` 会自动复制 / 重下；部分图片 CDN 失败用 `--force-download` 补漏。参见 [按演员同步](#按演员同步相册数量与-skip-策略)。
+7. **只有 `.v2dl_album.json` 没有图片**：视为空相册，重跑 `sync` 会重新 scrape；若仍失败可加 `--force-download`。
 
 ---
 
@@ -327,8 +408,9 @@ Register-ScheduledTask -TaskName "v2dl-sync-daily" -Action $action -Trigger $tri
 4. 想按演员订阅了再 `discover actors --only-selected` —— 只跑被你勾选过的机构，速度可接受；翻页是全量的，确保**每个演员都能落到表里**。
 5. **`sync_actors_profile.py -d D:\v2ph_archive`**（分多天跑，受 CF 配额限制）—— 把每个演员的基本信息 + 头像逐个采集进 `<destination>\_avatars\`，跑完就有了一个"看脸库"。
 6. **翻 `_avatars\` 看脸**，在 `actors.xlsx` 里把感兴趣的演员勾 `是否采集 = 1`，保存。
-7. 用 `sync --input data/sync/actors.xlsx` 跑演员维度的同步，把刚才挑出来的人专辑都下下来。
-8. 把整套 `sync` 命令塞进 `v2dl-sync.ps1` 用任务计划程序定时跑。
+7. 用 `sync --input data/sync/actors.xlsx --mode full` 跑演员维度的同步，把刚才挑出来的人专辑都下下来。
+8. CDN 中断或个别相册不完整时，加 `--force-download` 再跑一轮（已完整的不会重下）。
+9. 把整套 `sync` 命令塞进 `v2dl-sync.ps1` 用任务计划程序定时跑。
 
 ---
 

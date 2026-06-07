@@ -378,12 +378,54 @@ class ScrapeManager:
                 return folder
         return None
 
-    def _album_present_for_current_actor(
+    def _listed_photo_count_for_album(self, clean_url: str) -> int | None:
+        if self.profile_db is None:
+            return None
+        row = None
+        url_candidates = [clean_url]
+        if clean_url.endswith(".html"):
+            url_candidates.append(clean_url[:-5])
+        else:
+            url_candidates.append(f"{clean_url}.html")
+        for candidate in url_candidates:
+            try:
+                row = self.profile_db.get_album_by_url(candidate)
+            except Exception:
+                row = None
+            if row:
+                break
+        if not row:
+            return None
+        listed = row.get("listed_photo_count")
+        return int(listed) if listed else None
+
+    def _album_is_complete_at(self, folder: Path, clean_url: str) -> bool:
+        """True when ``folder`` holds the expected number of images.
+
+        When the profile DB knows ``listed_photo_count``, completeness
+        means on-disk count >= listed. Otherwise any image file counts
+        as complete (legacy behaviour for rows without a listed count).
+        """
+        try:
+            on_disk = count_files(folder)
+        except ValueError:
+            return False
+        if on_disk == 0:
+            return False
+        listed = self._listed_photo_count_for_album(clean_url)
+        if listed is not None and listed > 0:
+            return on_disk >= listed
+        return True
+
+    def _actor_album_should_skip(
         self, strategy: ImageScraper, clean_url: str
     ) -> bool:
+        """Whether this album under the current actor listing can be skipped."""
         folder = self._find_album_folder_for_actor(strategy, clean_url)
         if folder is None:
             return False
+        if self.config.static_config.retry_incomplete:
+            return self._album_is_complete_at(folder, clean_url)
         try:
             return count_files(folder) > 0
         except ValueError:
@@ -475,31 +517,65 @@ class ScrapeManager:
         target_page: int | list[int],
     ) -> bool:
         """Actor-listing skip/adopt path. Returns True when fully handled."""
-        if self._album_present_for_current_actor(strategy, clean_url):
-            folder = self._find_album_folder_for_actor(strategy, clean_url)
-            if folder is not None:
-                strategy.last_album_dest = str(folder)
+        local_folder = self._find_album_folder_for_actor(strategy, clean_url)
+        if self._actor_album_should_skip(strategy, clean_url):
+            if local_folder is not None:
+                strategy.last_album_dest = str(local_folder)
                 try:
-                    strategy.last_album_success_count = count_files(folder)
+                    strategy.last_album_success_count = count_files(local_folder)
                 except ValueError:
                     pass
                 self._record_actor_album_placement(strategy, clean_url)
-            self.logger.info(
-                "Album %s already present under '%s', skipping.",
-                album_url,
-                strategy._parent_slug,
-            )
+            if self.config.static_config.retry_incomplete:
+                self.logger.info(
+                    "Album %s already complete under '%s', skipping.",
+                    album_url,
+                    strategy._parent_slug,
+                )
+            else:
+                self.logger.info(
+                    "Album %s already present under '%s', skipping.",
+                    album_url,
+                    strategy._parent_slug,
+                )
             return True
 
         if not self.album_tracker.is_downloaded(clean_url):
             return False
 
         source_dir = self._lookup_global_album_source(clean_url)
-        if source_dir is not None and count_files(source_dir) > 0:
-            await self._adopt_album_into_actor_listing(
-                album_url, clean_url, strategy, source_dir, target_page
-            )
-            return True
+        if source_dir is not None:
+            try:
+                source_count = count_files(source_dir)
+            except ValueError:
+                source_count = 0
+            if source_count > 0:
+                if self.config.static_config.retry_incomplete and (
+                    not self._album_is_complete_at(source_dir, clean_url)
+                ):
+                    self.logger.info(
+                        "Album %s source folder is incomplete (%s, %d images); "
+                        "re-scraping for '%s'.",
+                        album_url,
+                        source_dir,
+                        source_count,
+                        strategy._parent_slug,
+                    )
+                    return False
+                if (
+                    local_folder is not None
+                    and source_dir.resolve() == local_folder.resolve()
+                ):
+                    self.logger.info(
+                        "Album %s folder under '%s' is incomplete; re-scraping.",
+                        album_url,
+                        strategy._parent_slug,
+                    )
+                    return False
+                await self._adopt_album_into_actor_listing(
+                    album_url, clean_url, strategy, source_dir, target_page
+                )
+                return True
 
         if source_dir is not None and count_files(source_dir) == 0:
             self.logger.info(

@@ -98,6 +98,11 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "chrome_args": None,
         "no_metadata": False,
         "force_download": False,
+        # Re-scrape albums that are missing or partially downloaded while
+        # still skipping albums that already have enough on-disk images.
+        # Wired from ``sync_local.py --force-download``; NOT the same as
+        # ``force_download`` which re-fetches everything blindly.
+        "retry_incomplete": False,
         "terminate": False,
         "use_default_chrome_profile": False,
         "log_level": -1,

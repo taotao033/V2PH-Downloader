@@ -188,6 +188,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Per-download speed limit in kbps (capped at {RATE_LIMIT_CEILING_KBPS}).",
     )
     ps.add_argument(
+        "--force-download",
+        action="store_true",
+        help=(
+            "Retry albums that are empty or partially downloaded (on-disk "
+            "image count below the site's listed count). Albums already "
+            "complete are still skipped; existing image files are not "
+            "re-fetched."
+        ),
+    )
+    ps.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the planned v2dl invocation and exit without running it.",
@@ -1066,6 +1076,8 @@ def _sync(args: argparse.Namespace) -> int:
             # albums are listed first chronologically, and already-downloaded
             # albums get skipped instantly via download_log_path.
             cmd.extend(["--range", "1"])
+        if args.force_download:
+            cmd.append("--retry-incomplete")
 
         print("[sync] running:", " ".join(f'"{a}"' if " " in a else a for a in cmd))
         if args.dry_run:

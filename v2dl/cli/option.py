@@ -122,6 +122,17 @@ def parse_arguments(args: list[str] | None = None) -> argparse.Namespace:
     )
 
     general.add_argument(
+        "--retry-incomplete",
+        dest="retry_incomplete",
+        action="store_true",
+        help=(
+            "Re-scrape albums that are empty or have fewer on-disk images "
+            "than the site-listed count; albums already complete are still "
+            "skipped. Does not re-download existing image files."
+        ),
+    )
+
+    general.add_argument(
         "-l",
         "--language",
         default="",

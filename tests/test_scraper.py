@@ -152,6 +152,36 @@ def test_image_scraper_xpath_legacy_layout():
     ]
 
 
+def test_album_is_complete_at_partial_vs_full(tmp_path):
+    from unittest.mock import MagicMock
+
+    from v2dl.scraper.manager import ScrapeManager
+
+    album_dir = tmp_path / "album"
+    album_dir.mkdir()
+    (album_dir / "001.jpg").write_bytes(b"x")
+    (album_dir / "002.jpg").write_bytes(b"x")
+
+    manager = MagicMock(spec=ScrapeManager)
+    manager.profile_db = MagicMock()
+    manager.profile_db.get_album_by_url.return_value = {
+        "listed_photo_count": 90,
+    }
+    manager._listed_photo_count_for_album = (
+        ScrapeManager._listed_photo_count_for_album.__get__(manager, ScrapeManager)
+    )
+    manager._album_is_complete_at = (
+        ScrapeManager._album_is_complete_at.__get__(manager, ScrapeManager)
+    )
+
+    clean_url = "https://www.v2ph.com/album/example.html"
+    assert manager._album_is_complete_at(album_dir, clean_url) is False
+
+    for i in range(3, 91):
+        (album_dir / f"{i:03d}.jpg").write_bytes(b"x")
+    assert manager._album_is_complete_at(album_dir, clean_url) is True
+
+
 def test_mirror_album_files_copies_images(tmp_path):
     from v2dl.scraper.manager import ScrapeManager
 

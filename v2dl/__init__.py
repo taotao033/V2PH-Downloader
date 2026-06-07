@@ -156,6 +156,9 @@ class V2DLApp:
         if args.force_download:
             cset(section, "force_download", args.force_download)
 
+        if getattr(args, "retry_incomplete", False):
+            cset(section, "retry_incomplete", args.retry_incomplete)
+
         if args.terminate:
             cset(section, "terminate", args.terminate)
 

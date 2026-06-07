@@ -19,6 +19,7 @@ class StaticConfig:
     chrome_args: str
     no_metadata: bool
     force_download: bool
+    retry_incomplete: bool
     terminate: bool
     use_default_chrome_profile: bool
     log_level: int
