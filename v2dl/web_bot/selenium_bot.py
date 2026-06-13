@@ -537,8 +537,6 @@ return (function () {
     # See ``DrissionBot._CAPTCHA_AUTO_ATTEMPTS`` for rationale.
     _CAPTCHA_AUTO_ATTEMPTS = 5
     _CAPTCHA_SUBMIT_WAIT = 6.0
-    _CAPTCHA_RELOAD_WAIT = 10.0
-    _CAPTCHA_MANUAL_NUDGE_INTERVAL = 30.0
 
     def _get_ocr(self) -> Any:
         """Return a lazily-initialised ``ddddocr.DdddOcr`` instance, or
@@ -561,33 +559,19 @@ return (function () {
             return None
         return self._ocr
 
-    _CAPTCHA_IMAGE_READ_JS = """
-return (function () {
-    var el = document.getElementById('captcha-image');
-    if (!el) return '';
-    if (el.complete && el.naturalWidth > 0) {
-        try {
-            var c = document.createElement('canvas');
-            c.width = el.naturalWidth;
-            c.height = el.naturalHeight;
-            c.getContext('2d').drawImage(el, 0, 0);
-            return c.toDataURL('image/png');
-        } catch (e) {}
-    }
-    return el.src || '';
-})();
-"""
-
     def _read_captcha_image_bytes(self) -> bytes | None:
-        """Pull the bytes of the current captcha image.
-
-        Prefer a canvas snapshot of the rendered ``<img>`` and fall
-        back to the inline ``data:image/png;base64`` ``src``.
+        """Pull the bytes of the current captcha image out of the
+        ``<img id="captcha-image" src="data:image/png;base64,...">``
+        tag. Returns ``None`` if the element / src is missing or the
+        base64 decode fails.
         """
         try:
-            src = self.driver.execute_script(self._CAPTCHA_IMAGE_READ_JS)
+            src = self.driver.execute_script(
+                "var el = document.getElementById('captcha-image'); "
+                "return el ? el.src : '';"
+            )
         except Exception as e:
-            self.logger.debug("captcha image read failed: %s", e)
+            self.logger.debug("captcha image src read failed: %s", e)
             return None
         if not isinstance(src, str) or "," not in src:
             return None
@@ -598,23 +582,6 @@ return (function () {
             self.logger.debug("captcha image base64 decode failed: %s", e)
             return None
 
-    def _wait_for_captcha_ready(self, timeout: float | None = None) -> bool:
-        """Block until the captcha form and inline PNG are back after a
-        ``location.reload()`` refresh.
-        """
-        deadline = time.time() + (timeout or self._CAPTCHA_RELOAD_WAIT)
-        while time.time() < deadline:
-            time.sleep(0.4)
-            try:
-                if not self._is_image_captcha_page():
-                    return False
-                img_bytes = self._read_captcha_image_bytes()
-                if img_bytes and len(img_bytes) > 500:
-                    return True
-            except Exception:
-                pass
-        return False
-
     def _refresh_captcha_image(self) -> None:
         """Click the captcha image so v2ph's ``location.reload()``
         handler fetches a fresh challenge.
@@ -624,23 +591,8 @@ return (function () {
                 "var el = document.getElementById('captcha-image'); "
                 "if (el) el.click();"
             )
-            if not self._wait_for_captcha_ready():
-                self.logger.debug(
-                    "captcha page did not finish reloading within %.0fs",
-                    self._CAPTCHA_RELOAD_WAIT,
-                )
         except Exception as e:
             self.logger.debug("captcha image refresh failed: %s", e)
-
-    def _bring_browser_to_front(self) -> None:
-        """Best-effort: raise the Selenium-controlled Chromium window."""
-        try:
-            self.driver.execute_cdp_cmd("Page.bringToFront", {})
-        except Exception:
-            try:
-                self.driver.execute_cdp_cmd("Browser.bringToFront", {})
-            except Exception as e:
-                self.logger.debug("bringToFront failed: %s", e)
 
     def _try_auto_solve_captcha_once(self, attempt: int) -> bool:
         """Run a single OCR-and-submit cycle. Returns True iff the
@@ -661,8 +613,12 @@ return (function () {
             return False
 
         text = prediction.strip() if isinstance(prediction, str) else ""
+        # v2ph's captcha is always 4 ASCII alphanumeric characters.
+        # If OCR returns punctuation / whitespace / non-ASCII it's
+        # garbage; refresh and skip the submit.
         if (
             not text
+            or len(text) < 3
             or len(text) > 8
             or not text.isascii()
             or not text.isalnum()
@@ -673,20 +629,13 @@ return (function () {
                 attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
             )
             self._refresh_captcha_image()
+            time.sleep(random.uniform(0.5, 1.0))
             return False
 
-        if len(text) != 4:
-            self.logger.info(
-                "Captcha auto-solve attempt %d/%d: OCR returned %r "
-                "(expected 4 chars) - submitting anyway",
-                attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
-            )
-        else:
-            self.logger.info(
-                "Captcha auto-solve attempt %d/%d: submitting OCR "
-                "prediction %r",
-                attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
-            )
+        self.logger.info(
+            "Captcha auto-solve attempt %d/%d: submitting OCR prediction %r",
+            attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
+        )
 
         try:
             input_field = self.driver.find_element(By.ID, "captcha_code")
@@ -773,8 +722,6 @@ return (function () {
                 "resume automatically once verified."
             )
 
-        self._bring_browser_to_front()
-        last_nudge = time.time()
         while True:
             try:
                 if not self._is_image_captcha_page():
@@ -783,14 +730,6 @@ return (function () {
             except Exception:
                 self.logger.info("Captcha completed - continuing process")
                 return True
-            now = time.time()
-            if now - last_nudge >= self._CAPTCHA_MANUAL_NUDGE_INTERVAL:
-                self.logger.info(
-                    "Still waiting for manual captcha input in the "
-                    "open browser..."
-                )
-                self._bring_browser_to_front()
-                last_nudge = now
             time.sleep(random.uniform(1.0, 2.0))
 
     def cookies_login(self) -> bool:

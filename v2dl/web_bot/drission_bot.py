@@ -745,15 +745,6 @@ return (function () {
     # but slow networks / VPNs can push it past 3 s.
     _CAPTCHA_SUBMIT_WAIT = 6.0
 
-    # v2ph's captcha-image click handler calls ``location.reload()``.
-    # We need to wait for the fresh inline PNG before the next OCR
-    # pass; 0.5 s was too short and kept re-reading stale bytes.
-    _CAPTCHA_RELOAD_WAIT = 10.0
-
-    # Nudge the user while polling for a manual solve so the process
-    # doesn't look hung after auto-solve gives up.
-    _CAPTCHA_MANUAL_NUDGE_INTERVAL = 30.0
-
     def _get_ocr(self) -> Any:
         """Return a lazily-initialised ``ddddocr.DdddOcr`` instance, or
         ``None`` if the dependency isn't installed or initialisation
@@ -778,34 +769,19 @@ return (function () {
             return None
         return self._ocr
 
-    _CAPTCHA_IMAGE_READ_JS = """
-return (function () {
-    var el = document.getElementById('captcha-image');
-    if (!el) return '';
-    if (el.complete && el.naturalWidth > 0) {
-        try {
-            var c = document.createElement('canvas');
-            c.width = el.naturalWidth;
-            c.height = el.naturalHeight;
-            c.getContext('2d').drawImage(el, 0, 0);
-            return c.toDataURL('image/png');
-        } catch (e) {}
-    }
-    return el.src || '';
-})();
-"""
-
     def _read_captcha_image_bytes(self) -> bytes | None:
-        """Pull the bytes of the current captcha image.
-
-        Prefer a canvas snapshot of the rendered ``<img>`` (what the
-        user sees) and fall back to the inline ``data:image/png;base64``
-        ``src`` attribute.
+        """Pull the bytes of the current captcha image out of the
+        ``<img id="captcha-image" src="data:image/png;base64,...">``
+        tag. Returns ``None`` if the element / src is missing or the
+        base64 decode fails.
         """
         try:
-            src = self.page.run_js(self._CAPTCHA_IMAGE_READ_JS)
+            src = self.page.run_js(
+                "var el = document.getElementById('captcha-image'); "
+                "return el ? el.src : '';"
+            )
         except Exception as e:
-            self.logger.debug("captcha image read failed: %s", e)
+            self.logger.debug("captcha image src read failed: %s", e)
             return None
         if not isinstance(src, str) or "," not in src:
             return None
@@ -816,38 +792,17 @@ return (function () {
             self.logger.debug("captcha image base64 decode failed: %s", e)
             return None
 
-    def _wait_for_captcha_ready(self, timeout: float | None = None) -> bool:
-        """Block until the captcha form and inline PNG are back after a
-        ``location.reload()`` refresh.
-        """
-        deadline = time.time() + (timeout or self._CAPTCHA_RELOAD_WAIT)
-        while time.time() < deadline:
-            time.sleep(0.4)
-            try:
-                if not self._is_image_captcha_page():
-                    return False
-                img_bytes = self._read_captcha_image_bytes()
-                if img_bytes and len(img_bytes) > 500:
-                    return True
-            except Exception:
-                pass
-        return False
-
     def _refresh_captcha_image(self) -> None:
         """Click the captcha image to trigger v2ph's built-in
         ``location.reload()`` handler so the next attempt sees a
-        fresh challenge. Used only when OCR returns nothing usable.
+        fresh challenge. Used when OCR returns garbage and we don't
+        want to waste a Submit round-trip on it.
         """
         try:
             self.page.run_js(
                 "var el = document.getElementById('captcha-image'); "
                 "if (el) el.click();"
             )
-            if not self._wait_for_captcha_ready():
-                self.logger.debug(
-                    "captcha page did not finish reloading within %.0fs",
-                    self._CAPTCHA_RELOAD_WAIT,
-                )
         except Exception as e:
             self.logger.debug("captcha image refresh failed: %s", e)
 
@@ -855,11 +810,10 @@ return (function () {
         """Run a single OCR-and-submit cycle. Returns True iff the
         captcha page is no longer present after the attempt.
 
-        When OCR returns nothing usable we refresh the image. Any
-        non-empty ASCII alphanumeric guess (even 1-2 characters such as
-        ``'Pk'``) is still submitted: v2ph expects 4 characters but
-        rejects wrong answers with a fresh captcha, which is better
-        than looping on refresh-only attempts that never POST.
+        On garbage OCR output (wrong length / non-alphanumeric) we
+        refresh the image instead of submitting, since v2ph's captcha
+        is always 4 ASCII alphanumeric chars and submitting noise
+        just burns a server-side rate-limit token.
         """
         ocr = self._get_ocr()
         if ocr is None:
@@ -876,8 +830,14 @@ return (function () {
             return False
 
         text = prediction.strip() if isinstance(prediction, str) else ""
+        # v2ph's captcha is always 4 ASCII alphanumeric characters.
+        # If OCR produces punctuation, whitespace or non-ASCII glyphs
+        # (e.g. it picked up a noise line as a Chinese radical) it's
+        # garbage; refresh and skip the submit to save a server-side
+        # rate-limit token.
         if (
             not text
+            or len(text) < 3
             or len(text) > 8
             or not text.isascii()
             or not text.isalnum()
@@ -888,20 +848,13 @@ return (function () {
                 attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
             )
             self._refresh_captcha_image()
+            DriBehavior.random_sleep(0.5, 1.0)
             return False
 
-        if len(text) != 4:
-            self.logger.info(
-                "Captcha auto-solve attempt %d/%d: OCR returned %r "
-                "(expected 4 chars) - submitting anyway",
-                attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
-            )
-        else:
-            self.logger.info(
-                "Captcha auto-solve attempt %d/%d: submitting OCR "
-                "prediction %r",
-                attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
-            )
+        self.logger.info(
+            "Captcha auto-solve attempt %d/%d: submitting OCR prediction %r",
+            attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
+        )
 
         input_field = self.page("#captcha_code")
         submit_btn = self.page("#submit")
@@ -1012,8 +965,6 @@ return (function () {
                 "resume automatically once verified."
             )
 
-        self._bring_chromium_to_front()
-        last_nudge = time.time()
         while True:
             try:
                 if not self._is_image_captcha_page():
@@ -1025,14 +976,6 @@ return (function () {
                 # loop re-check.
                 self.logger.info("Captcha completed - continuing process")
                 return True
-            now = time.time()
-            if now - last_nudge >= self._CAPTCHA_MANUAL_NUDGE_INTERVAL:
-                self.logger.info(
-                    "Still waiting for manual captcha input in the "
-                    "open browser..."
-                )
-                self._bring_chromium_to_front()
-                last_nudge = now
             DriBehavior.random_sleep(1.0, 2.0)
 
     def cookies_login(self) -> bool:
