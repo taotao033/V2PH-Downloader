@@ -133,6 +133,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         # using the integrated extractor (planned: dedicated CLI flag).
         "profile_db_path": "",
         "avatar_dir": "",
+        "cover_dir": "",
     },
     "runtime_config": {
         "url": "",

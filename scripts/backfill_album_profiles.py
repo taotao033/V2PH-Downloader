@@ -54,11 +54,15 @@ for _p in (REPO_ROOT, SCRIPTS_DIR):
     if sp not in sys.path:
         sys.path.insert(0, sp)
 
+from pathvalidate import sanitize_filename  # noqa: E402
 from lxml import html as lxml_html  # noqa: E402
 
 from v2dl import V2DLApp  # noqa: E402
 from v2dl.cli import parse_arguments  # noqa: E402
+from v2dl.scraper.core import ImageScraper  # noqa: E402
+from v2dl.scraper.downloader import DownloadPathTool  # noqa: E402
 from v2dl.scraper.profiles import (  # noqa: E402
+    AlbumProfile,
     CompanyProfile,
     ProfileDB,
     ProfileExtractor,
@@ -134,6 +138,32 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip Source B (downloaded_albums.txt). Only process DB rows.",
     )
+    p.add_argument(
+        "--cover-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to save album cover images. "
+            "Defaults to <destination>/_covers. "
+            "Pass an empty string to disable cover download."
+        ),
+    )
+    p.add_argument(
+        "--no-cover",
+        action="store_true",
+        help="Skip cover image download entirely (only update text fields).",
+    )
+    p.add_argument(
+        "--cover-only",
+        action="store_true",
+        help=(
+            "Download covers for albums that already have cover_url in the DB "
+            "but no cover_local_path. Skips page re-fetch entirely — useful when "
+            "some album pages are Cloudflare-blocked but the CDN image is still "
+            "accessible via curl-cffi. "
+            "Incompatible with --no-cover."
+        ),
+    )
     return p
 
 
@@ -157,23 +187,37 @@ def _needs_backfill(row: dict[str, Any]) -> bool:
     )
 
 
-def _load_db_candidates(db: ProfileDB, *, force: bool) -> list[dict[str, Any]]:
-    """Return album rows that need backfill."""
+def _load_db_candidates(
+    db: ProfileDB, *, force: bool, cover_only: bool = False
+) -> list[dict[str, Any]]:
+    """Return album rows that need backfill.
+
+    When ``cover_only`` is True, returns only rows that have a ``cover_url``
+    but no ``cover_local_path`` (cover was not yet downloaded).
+    """
     import sqlite3
     conn = sqlite3.connect(db.db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         if force:
+            rows = conn.execute("SELECT * FROM albums ORDER BY id").fetchall()
+        elif cover_only:
             rows = conn.execute(
-                "SELECT * FROM albums ORDER BY id"
+                """
+                SELECT * FROM albums
+                WHERE cover_url IS NOT NULL
+                  AND cover_local_path IS NULL
+                ORDER BY id
+                """
             ).fetchall()
         else:
             rows = conn.execute(
                 """
                 SELECT * FROM albums
-                WHERE company_id IS NULL
-                  AND volume_number IS NULL
-                  AND description IS NULL
+                WHERE (company_id IS NULL
+                       AND volume_number IS NULL
+                       AND description IS NULL)
+                   OR cover_url IS NULL
                 ORDER BY id
                 """
             ).fetchall()
@@ -212,6 +256,7 @@ class _BackfillSession:
     def __init__(self, destination: Path) -> None:
         self.destination = destination
         self.app: V2DLApp | None = None
+        self._cdn_warmed: bool = False
 
     async def __aenter__(self) -> "_BackfillSession":
         argv = ["-d", str(self.destination), "https://www.v2ph.com/"]
@@ -233,6 +278,52 @@ class _BackfillSession:
         from v2dl.scraper.tools import UrlHandler
         page1_url = UrlHandler.add_page_num(album_url, 1)
         return await self.app.bot.auto_page_scroll(page1_url, page_sleep=0)
+
+    @property
+    def image_strategy(self) -> ImageScraper:
+        assert self.app is not None
+        s = self.app.scraper.strategies.get("album_image")
+        if not isinstance(s, ImageScraper):
+            raise RuntimeError("album_image strategy not found")
+        return s
+
+    def _ensure_cdn_warmed(self, url: str) -> None:
+        if self._cdn_warmed:
+            return
+        assert self.app is not None
+        try:
+            self.app.bot.ensure_cdn_warmed(url)
+            self._cdn_warmed = True
+        except Exception:
+            pass
+
+    async def download_cover(self, cover_url: str, dest: Path) -> Path | None:
+        """Download a cover image; returns the actual written path or None."""
+        assert self.app is not None
+        self._ensure_cdn_warmed(cover_url)
+        try:
+            cookies = self.app.bot.get_cookies()
+        except Exception:
+            cookies = {}
+        try:
+            ok = await self.image_strategy.download_file(
+                cover_url,
+                dest,
+                cookies=cookies,
+                web_bot=self.app.bot,
+            )
+        except Exception as e:
+            print(f"  [WARN] cover download raised: {e}", file=sys.stderr)
+            return None
+        if not ok:
+            return None
+        # download_file may rewrite suffix; locate whatever was written.
+        if dest.exists():
+            return dest
+        for sibling in dest.parent.glob(f"{dest.stem}.*"):
+            if sibling.is_file():
+                return sibling
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +352,12 @@ def _upsert_with_preserved_counts(
     return db.upsert_album(profile)
 
 
+def _cover_dest(album_slug: str | None, cover_dir: Path) -> Path:
+    slug = album_slug or "album"
+    safe = sanitize_filename(slug) or "album"
+    return cover_dir / f"{safe}.jpg"
+
+
 async def _process_album(
     session: _BackfillSession,
     db: ProfileDB,
@@ -268,8 +365,9 @@ async def _process_album(
     existing_row: dict[str, Any] | None,
     *,
     label: str,
+    cover_dir: Path | None = None,
 ) -> bool:
-    """Fetch page 1 and upsert. Returns True on success."""
+    """Fetch page 1, upsert profile, optionally download cover. Returns True on success."""
     print(f"  [fetch] {label}")
     try:
         html_content = await session.fetch_page1(album_url)
@@ -292,6 +390,12 @@ async def _process_album(
     except Exception as e:
         print(f"  [ERROR] extract_album failed: {e}", file=sys.stderr)
         return False
+
+    # Preserve existing cover_local_path so we don't overwrite with None.
+    if existing_row and existing_row.get("cover_local_path"):
+        profile.cover_local_path = str(existing_row["cover_local_path"])
+    if existing_row and existing_row.get("cover_url") and not profile.cover_url:
+        profile.cover_url = str(existing_row["cover_url"])
 
     # Upsert company first, then set FK on the album profile.
     if profile.company is not None and profile.company.url:
@@ -319,14 +423,138 @@ async def _process_album(
         bits.append(f"vol={profile.volume_number!r}")
     if profile.description:
         bits.append(f"desc={profile.description[:30]!r}…")
+    if profile.cover_url:
+        bits.append(f"cover_url=✓")
+
+    # Download cover image if requested and not already on disk.
+    if cover_dir is not None and profile.cover_url and not profile.cover_local_path:
+        dest = _cover_dest(profile.album_slug, cover_dir)
+        # Skip if any extension variant already exists.
+        existing = dest if dest.exists() else next(
+            (s for s in dest.parent.glob(f"{dest.stem}.*") if s.is_file()), None
+        )
+        if existing:
+            try:
+                db.update_album_cover_path(album_id, str(existing))
+            except Exception:
+                pass
+            bits.append("cover=cached")
+        else:
+            actual = await session.download_cover(profile.cover_url, dest)
+            if actual:
+                try:
+                    db.update_album_cover_path(album_id, str(actual))
+                    bits.append(f"cover=saved")
+                except Exception as e:
+                    print(f"  [WARN] cover path update failed: {e}", file=sys.stderr)
+            else:
+                bits.append("cover=failed")
+
     print(f"  [OK] id={album_id} {' '.join(bits) or '(no new fields on page)'}")
     return True
+
+
+async def _download_cover_only(
+    session: _BackfillSession,
+    db: ProfileDB,
+    cover_dir: Path,
+    *,
+    limit: int = 0,
+    sleep: float = SLEEP_BETWEEN_ALBUMS,
+) -> tuple[int, int]:
+    """Download covers for DB rows that have cover_url but no cover_local_path.
+
+    Does NOT re-fetch the album page. Works even when album pages are
+    Cloudflare-blocked, because the CDN image is fetched via curl-cffi
+    with browser impersonation (same mechanism as regular photo downloads).
+
+    Returns (succeeded, failed).
+    """
+    import sqlite3
+    conn = sqlite3.connect(db.db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT id, album_slug, cover_url, cover_local_path
+        FROM albums
+        WHERE cover_url IS NOT NULL
+          AND (cover_local_path IS NULL OR cover_local_path = '')
+        ORDER BY id
+        """
+    ).fetchall()
+    conn.close()
+
+    rows = [dict(r) for r in rows]
+    if limit:
+        rows = rows[:limit]
+
+    total = len(rows)
+    print(f"[cover-only] albums needing cover download: {total}")
+    if total == 0:
+        return 0, 0
+
+    succeeded = failed = 0
+    for i, row in enumerate(rows, 1):
+        album_id = int(row["id"])
+        slug = row.get("album_slug") or "album"
+        cover_url = str(row["cover_url"])
+        dest = _cover_dest(slug, cover_dir)
+
+        # Check if already present on disk under any extension.
+        existing = dest if dest.exists() else next(
+            (s for s in dest.parent.glob(f"{dest.stem}.*") if s.is_file()), None
+        )
+        if existing:
+            try:
+                db.update_album_cover_path(album_id, str(existing))
+            except Exception:
+                pass
+            print(f"  [{i}/{total}] cached  {slug}: {existing.name}")
+            succeeded += 1
+            continue
+
+        print(f"  [{i}/{total}] download {slug}: {cover_url}")
+        actual = await session.download_cover(cover_url, dest)
+        if actual:
+            try:
+                db.update_album_cover_path(album_id, str(actual))
+            except Exception as e:
+                print(f"  [WARN] cover path update failed: {e}", file=sys.stderr)
+            print(f"  [{i}/{total}] saved   → {actual.name}")
+            succeeded += 1
+        else:
+            print(f"  [{i}/{total}] FAILED  {cover_url}", file=sys.stderr)
+            failed += 1
+
+        if i < total:
+            time.sleep(sleep)
+
+    return succeeded, failed
 
 
 # --------------------------------------------------------------------------- #
 # main loop
 # --------------------------------------------------------------------------- #
+def _resolve_cover_dir(args: argparse.Namespace) -> Path | None:
+    """Return the cover directory, or None if download is disabled."""
+    if args.no_cover:
+        return None
+    if args.cover_dir is not None:
+        p = Path(args.cover_dir)
+    else:
+        p = Path(args.destination) / "_covers"
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"[backfill] WARNING: cannot create cover dir {p}: {e}", file=sys.stderr)
+        return None
+    return p
+
+
 async def _run(args: argparse.Namespace) -> int:
+    if getattr(args, "cover_only", False) and getattr(args, "no_cover", False):
+        raise SystemExit("[backfill] --cover-only and --no-cover are mutually exclusive.")
+
     db_path = _resolve_db_path(args)
     log_path = _resolve_log_path(args)
 
@@ -338,6 +566,34 @@ async def _run(args: argparse.Namespace) -> int:
         )
 
     db = ProfileDB(db_path)
+    cover_dir = _resolve_cover_dir(args)
+
+    # ------------------------------------------------------------------ #
+    # --cover-only branch: download covers for rows that already have
+    # cover_url in the DB, bypassing the album-page fetch entirely.
+    # ------------------------------------------------------------------ #
+    if getattr(args, "cover_only", False):
+        if cover_dir is None:
+            raise SystemExit("[backfill] --cover-only requires a valid cover dir (not --no-cover).")
+        print(f"[backfill] profile DB:  {db_path}")
+        print(f"[backfill] cover dir:   {cover_dir}")
+        print("[backfill] mode: COVER-ONLY (no page re-fetch)")
+        if args.dry_run:
+            import sqlite3
+            conn = sqlite3.connect(db.db_path, timeout=30)
+            n = conn.execute(
+                "SELECT COUNT(*) FROM albums WHERE cover_url IS NOT NULL "
+                "AND (cover_local_path IS NULL OR cover_local_path = '')"
+            ).fetchone()[0]
+            conn.close()
+            print(f"[backfill] DRY RUN — {n} covers would be downloaded")
+            return 0
+        async with _BackfillSession(args.destination) as session:
+            ok, fail = await _download_cover_only(
+                session, db, cover_dir, limit=args.limit, sleep=args.sleep
+            )
+        print(f"\n[backfill] done. succeeded={ok} failed={fail}")
+        return 0 if fail == 0 else 1
 
     # -- Source A: DB rows needing backfill --
     db_candidates = _load_db_candidates(db, force=args.force)
@@ -354,6 +610,10 @@ async def _run(args: argparse.Namespace) -> int:
         f"[backfill] candidates:   {len(db_candidates)} DB rows + "
         f"{len(log_candidates)} log-only URLs  =  {total} total"
     )
+    if cover_dir:
+        print(f"[backfill] cover dir:    {cover_dir}")
+    else:
+        print("[backfill] cover download: disabled (--no-cover)")
 
     if args.force:
         print("[backfill] --force: re-processing all DB rows")
@@ -380,6 +640,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     succeeded = failed = 0
     processed = 0
+    grand_total = len(db_candidates) + len(log_candidates)
 
     async with _BackfillSession(args.destination) as session:
         # DB rows first
@@ -387,30 +648,28 @@ async def _run(args: argparse.Namespace) -> int:
             url = str(row.get("album_url") or "")
             title = str(row.get("title") or url)[:60]
             label = f"DB row {i}/{len(db_candidates)}: {title}"
-            ok = await _process_album(session, db, url, row, label=label)
+            ok = await _process_album(session, db, url, row, label=label, cover_dir=cover_dir)
             if ok:
                 succeeded += 1
             else:
                 failed += 1
             processed += 1
-            if processed < len(db_candidates) + len(log_candidates):
+            if processed < grand_total:
                 time.sleep(args.sleep)
 
         # Log-only URLs
         for i, url in enumerate(log_candidates, 1):
             label = f"log-only {i}/{len(log_candidates)}: {url}"
-            ok = await _process_album(session, db, url, None, label=label)
+            ok = await _process_album(session, db, url, None, label=label, cover_dir=cover_dir)
             if ok:
                 succeeded += 1
             else:
                 failed += 1
             processed += 1
-            if processed < len(db_candidates) + len(log_candidates):
+            if processed < grand_total:
                 time.sleep(args.sleep)
 
-    print(
-        f"\n[backfill] done. succeeded={succeeded} failed={failed}"
-    )
+    print(f"\n[backfill] done. succeeded={succeeded} failed={failed}")
     return 0 if failed == 0 else 1
 
 

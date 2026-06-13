@@ -123,6 +123,8 @@ class AlbumProfile:
     company_id: Optional[int] = None       # FK to companies; set by manager
     volume_number: Optional[str] = None    # e.g. "VOL.173"
     description: Optional[str] = None     # album-intro text block
+    cover_url: Optional[str] = None        # canonical CDN cover (og:image)
+    cover_local_path: Optional[str] = None # on-disk path after download
     download_dest: Optional[str] = None
     models: list[AlbumLink] = field(default_factory=list)
     tags: list[AlbumLink] = field(default_factory=list)
@@ -187,6 +189,8 @@ class ProfileDB:
         company_id           INTEGER,
         volume_number        TEXT,
         description          TEXT,
+        cover_url            TEXT,
+        cover_local_path     TEXT,
         download_dest        TEXT,
         first_seen_at        TEXT    NOT NULL,
         last_updated_at      TEXT    NOT NULL,
@@ -266,9 +270,11 @@ class ProfileDB:
         """
         new_cols: list[tuple[str, str, str]] = [
             # albums – new fields added in this release
-            ("albums", "company_id",    "INTEGER REFERENCES companies(id) ON DELETE SET NULL"),
-            ("albums", "volume_number", "TEXT"),
-            ("albums", "description",   "TEXT"),
+            ("albums", "company_id",       "INTEGER REFERENCES companies(id) ON DELETE SET NULL"),
+            ("albums", "volume_number",    "TEXT"),
+            ("albums", "description",      "TEXT"),
+            ("albums", "cover_url",        "TEXT"),
+            ("albums", "cover_local_path", "TEXT"),
             # companies – columns added after the initial companies table
             ("companies", "listed_album_count",  "INTEGER"),
             ("companies", "scraped_album_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -452,13 +458,15 @@ class ProfileDB:
                         album_url, album_slug, title, release_date,
                         listed_photo_count, scraped_photo_count, actor_id,
                         company_id, volume_number, description,
+                        cover_url, cover_local_path,
                         download_dest, first_seen_at, last_updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         p.album_url, p.album_slug, p.title, p.release_date,
                         p.listed_photo_count, p.scraped_photo_count, p.actor_id,
                         p.company_id, p.volume_number, p.description,
+                        p.cover_url, p.cover_local_path,
                         p.download_dest, now, now,
                     ),
                 )
@@ -477,6 +485,8 @@ class ProfileDB:
                         company_id          = COALESCE(?, company_id),
                         volume_number       = COALESCE(?, volume_number),
                         description         = COALESCE(?, description),
+                        cover_url           = COALESCE(?, cover_url),
+                        cover_local_path    = COALESCE(?, cover_local_path),
                         download_dest       = COALESCE(?, download_dest),
                         last_updated_at     = ?
                     WHERE id = ?
@@ -485,6 +495,7 @@ class ProfileDB:
                         p.album_slug, p.title, p.release_date,
                         p.listed_photo_count, p.scraped_photo_count,
                         p.actor_id, p.company_id, p.volume_number, p.description,
+                        p.cover_url, p.cover_local_path,
                         p.download_dest, now, album_id,
                     ),
                 )
@@ -539,6 +550,16 @@ class ProfileDB:
                     "UPDATE albums SET scraped_photo_count = ?, last_updated_at = ? WHERE album_url = ?",
                     (scraped_photo_count, now, album_url),
                 )
+            conn.commit()
+
+    def update_album_cover_path(self, album_id: int, local_path: str) -> None:
+        """Record the on-disk path of a downloaded album cover image."""
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE albums SET cover_local_path = ?, last_updated_at = ? WHERE id = ?",
+                (local_path, now, album_id),
+            )
             conn.commit()
 
     # -- read helpers -------------------------------------------------------
@@ -724,6 +745,11 @@ class ProfileExtractor:
             profile.description = cls._extract_album_description(tree)
         except Exception as e:
             logger.debug("album description extraction failed for %s: %s", album_url, e)
+
+        try:
+            profile.cover_url = cls._extract_cover_url(tree, base_url=album_url)
+        except Exception as e:
+            logger.debug("album cover url extraction failed for %s: %s", album_url, e)
 
         return profile
 
@@ -1032,6 +1058,30 @@ class ProfileExtractor:
                     return int(m.group(1))
                 except ValueError:
                     continue
+        return None
+
+    @staticmethod
+    @staticmethod
+    def _extract_cover_url(tree: html.HtmlElement, base_url: str) -> Optional[str]:
+        """Extract the album's canonical cover image from ``og:image`` meta.
+
+        Album pages expose the cover thumbnail via the Open Graph tag; this
+        is the same CDN URL that appears as the card thumbnail when the album
+        is listed on an actor / company page.  It is purposely distinct from
+        the first photo in the gallery.
+        """
+        for xp in (
+            "//meta[@property='og:image']/@content",
+            "//meta[@name='og:image']/@content",
+        ):
+            for raw in tree.xpath(xp):
+                src = (str(raw) or "").strip()
+                if not src or src.startswith("data:"):
+                    continue
+                lower = src.lower()
+                if "/logo" in lower or lower.endswith(".svg"):
+                    continue
+                return urljoin(base_url, src)
         return None
 
     @staticmethod

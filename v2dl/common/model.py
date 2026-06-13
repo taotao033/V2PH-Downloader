@@ -39,11 +39,12 @@ class StaticConfig:
     system_log_path: str
     chrome_exec_path: str
     chrome_profile_path: str
-    # Profile database (actor / album metadata) and avatar storage.
-    # Both default to subpaths of ``download_dir`` when left empty.
+    # Profile database (actor / album metadata) and avatar / cover storage.
+    # All default to subpaths of ``download_dir`` when left empty.
     # Set ``profile_db_path`` to "" via config.yaml to disable.
     profile_db_path: str = ""
     avatar_dir: str = ""
+    cover_dir: str = ""
 
 
 @dataclass

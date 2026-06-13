@@ -328,7 +328,7 @@ class ScrapeManager:
                 # have a record that we tried, even if VIP / blocked.
                 if isinstance(strategy, ImageScraper):
                     self._refresh_album_count_from_disk(strategy)
-                    self._persist_album_profile(strategy, clean_url)
+                    await self._persist_album_profile(strategy, clean_url)
                     self._record_actor_album_placement(strategy, clean_url)
                 return
 
@@ -343,7 +343,7 @@ class ScrapeManager:
                 # half the images are cache-hits and half are fresh
                 # downloads.
                 self._refresh_album_count_from_disk(strategy)
-                self._persist_album_profile(strategy, clean_url)
+                await self._persist_album_profile(strategy, clean_url)
                 self._record_actor_album_placement(strategy, clean_url)
         except Exception as e:
             self.logger.error(
@@ -666,7 +666,7 @@ class ScrapeManager:
         self.album_tracker.log_downloaded(clean_url)
 
         if strategy.last_album_profile is not None:
-            self._persist_album_profile(strategy, clean_url)
+            await self._persist_album_profile(strategy, clean_url)
         self._record_actor_album_placement(strategy, clean_url)
 
         self.logger.info(
@@ -716,7 +716,7 @@ class ScrapeManager:
             return
 
         self._refresh_album_count_from_disk(strategy)
-        self._persist_album_profile(strategy, clean_url)
+        await self._persist_album_profile(strategy, clean_url)
         self._record_actor_album_placement(strategy, clean_url)
 
     @staticmethod
@@ -865,6 +865,28 @@ class ScrapeManager:
             return None
         return dest
 
+    def _cover_dest_for(self, album: AlbumProfile) -> Path | None:
+        """Build a sanitised filesystem path for the album's cover image.
+
+        Falls back to ``<download_dir>/_covers`` when the dedicated
+        ``cover_dir`` is not set in config.
+        """
+        cover_dir = (self.config.static_config.cover_dir or "").strip()
+        if not cover_dir:
+            cover_dir = str(Path(self.config.static_config.download_dir or "") / "_covers")
+        if not cover_dir or cover_dir == "_covers":
+            return None
+
+        slug = album.album_slug or "album"
+        safe = sanitize_filename(slug) or "album"
+        dest = Path(cover_dir) / f"{safe}.jpg"
+        try:
+            DownloadPathTool.mkdir(dest.parent)
+        except Exception as e:
+            self.logger.debug("Failed to create cover dir %s: %s", dest.parent, e)
+            return None
+        return dest
+
     @staticmethod
     def _find_written_file(reference: Path) -> Path | None:
         """Find whichever extension variant of ``reference`` exists on disk.
@@ -908,7 +930,7 @@ class ScrapeManager:
                 "Failed to upsert company profile %s: %s", company.company_url, e
             )
 
-    def _persist_album_profile(self, strategy: ImageScraper, clean_url: str) -> None:
+    async def _persist_album_profile(self, strategy: ImageScraper, clean_url: str) -> None:
         """Upsert the captured album profile + counts to the profile DB."""
         if self.profile_db is None:
             return
@@ -945,7 +967,7 @@ class ScrapeManager:
             album_id = self.profile_db.upsert_album(profile)
             self.logger.info(
                 "Persisted album profile: %s (id=%d, scraped=%d/%s, "
-                "company=%s, volume=%s, models=%d, tags=%d)",
+                "company=%s, volume=%s, models=%d, tags=%d, cover=%s)",
                 profile.title or profile.album_slug or profile.album_url,
                 album_id,
                 profile.scraped_photo_count,
@@ -954,9 +976,44 @@ class ScrapeManager:
                 profile.volume_number,
                 len(profile.models),
                 len(profile.tags),
+                profile.cover_url is not None,
             )
         except Exception as e:
             self.logger.warning("Failed to upsert album profile %s: %s", clean_url, e)
+            return
+
+        # Download cover image when cover_url is available and not yet cached.
+        if not profile.cover_url or profile.cover_local_path:
+            return
+        cover_path = self._cover_dest_for(profile)
+        if cover_path is None:
+            return
+        # Skip if already downloaded (e.g. from a previous run).
+        if self._find_written_file(cover_path) is not None:
+            return
+        try:
+            cookies = self.web_bot.get_cookies()
+        except Exception:
+            cookies = {}
+        try:
+            ok = await strategy.download_file(
+                profile.cover_url,
+                cover_path,
+                cookies=cookies,
+                web_bot=self.web_bot,
+            )
+        except Exception as e:
+            self.logger.debug("Cover download raised for %s: %s", clean_url, e)
+            ok = False
+        if ok:
+            actual = self._find_written_file(cover_path)
+            if actual is not None:
+                try:
+                    self.profile_db.update_album_cover_path(album_id, str(actual))
+                except Exception as e:
+                    self.logger.debug("Failed to record cover path: %s", e)
+        else:
+            self.logger.debug("Cover download failed for %s; profile row still saved.", clean_url)
 
     def log_final_status(self) -> None:
         download_status = self.album_tracker.get_download_status
