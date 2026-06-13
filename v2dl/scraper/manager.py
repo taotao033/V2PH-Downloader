@@ -22,8 +22,11 @@ from v2dl.scraper.downloader import DownloadPathTool
 from v2dl.scraper.profiles import (
     ActorProfile,
     AlbumProfile,
+    CompanyProfile,
     ProfileDB,
     ProfileExtractor,
+    _strip_query,
+    _url_segment,
 )
 from v2dl.scraper.tools import AlbumTracker, DownloadStatus, LogKey, MetadataHandler, UrlHandler
 from v2dl.scraper.types import PageResultType, ScrapeType
@@ -63,12 +66,14 @@ class ScrapeManager:
         self.processed_urls: set[str] = set()
 
         # Profile DB (actor / album metadata). Lazily created when the
-        # config supplies a path. ``self._current_actor_id`` is set
-        # while a /actor/ listing is being scraped so that each album
-        # processed inside it can be linked back via FK; cleared once
-        # the listing finishes.
+        # config supplies a path. ``self._current_actor_id`` /
+        # ``self._current_company_id`` are set while a /actor/ or
+        # /company/ listing is being scraped so that each album processed
+        # inside it can be linked back via FK; cleared once the listing
+        # finishes.
         self.profile_db: ProfileDB | None = self._init_profile_db()
         self._current_actor_id: int | None = None
+        self._current_company_id: int | None = None
 
     async def start_scraping(self) -> bool:
         """Start scraping based on URL type."""
@@ -134,6 +139,7 @@ class ScrapeManager:
         if isinstance(strategy, AlbumScraper):
             strategy.last_display_name = None
             strategy.last_actor_profile = None
+            strategy.last_company_profile = None
         scraper = PageScraper(self.web_bot, strategy, self.logger)
 
         album_links = await scraper.scrape_all_pages(url, target_page)
@@ -158,15 +164,17 @@ class ScrapeManager:
                     parent_slug,
                 )
 
-        # Persist the captured actor profile (if any) BEFORE iterating
-        # over album URLs, so that each album's row can reference the
-        # actor via FK as it's inserted. Avatar download is best-effort
-        # and never blocks album scraping.
+        # Persist the captured actor / company profile (if any) BEFORE
+        # iterating over album URLs, so that each album row can reference
+        # the entity via FK as it's inserted. Avatar download is
+        # best-effort and never blocks album scraping.
         if isinstance(strategy, AlbumScraper) and strategy.last_actor_profile is not None:
             await self._persist_actor_profile(
                 strategy.last_actor_profile,
                 image_strategy if isinstance(image_strategy, ImageScraper) else None,
             )
+        if isinstance(strategy, AlbumScraper) and strategy.last_company_profile is not None:
+            self._persist_company_profile(strategy.last_company_profile)
 
         temp_original_url = self.runtime_config.url
         success_count = 0
@@ -213,6 +221,18 @@ class ScrapeManager:
                         self._current_actor_id, e,
                     )
                 self._current_actor_id = None
+
+            if self.profile_db is not None and self._current_company_id is not None:
+                try:
+                    self.profile_db.update_company_scraped_album_count(
+                        self._current_company_id, success_count
+                    )
+                except Exception as e:
+                    self.logger.debug(
+                        "Failed to persist scraped_album_count for company_id=%s: %s",
+                        self._current_company_id, e,
+                    )
+                self._current_company_id = None
 
         self.logger.info(
             "Album list processing completed: %d successful, %d failed",
@@ -864,6 +884,30 @@ class ScrapeManager:
             return None
         return None
 
+    def _persist_company_profile(self, company: CompanyProfile) -> None:
+        """Upsert a company profile captured from a /company/<slug> listing.
+
+        Sets ``self._current_company_id`` so subsequent album rows
+        within this listing can inherit the company FK even when the
+        individual album page does not carry a 机构 label (e.g. older
+        albums whose HTML pre-dates the field).
+        """
+        if self.profile_db is None:
+            return
+        try:
+            company_id = self.profile_db.upsert_company(company)
+            self._current_company_id = company_id
+            self.logger.info(
+                "Captured company profile: %s (id=%d, listed_albums=%s)",
+                company.name or company.company_slug or company.company_url,
+                company_id,
+                company.listed_album_count,
+            )
+        except Exception as e:
+            self.logger.warning(
+                "Failed to upsert company profile %s: %s", company.company_url, e
+            )
+
     def _persist_album_profile(self, strategy: ImageScraper, clean_url: str) -> None:
         """Upsert the captured album profile + counts to the profile DB."""
         if self.profile_db is None:
@@ -875,14 +919,39 @@ class ScrapeManager:
         profile.actor_id = self._current_actor_id
         profile.scraped_photo_count = strategy.last_album_success_count
         profile.download_dest = strategy.last_album_dest
+
+        # Resolve company FK: prefer the inline 机构 link from the
+        # album page itself, fall back to the listing context FK
+        # (_current_company_id) for albums whose page pre-dates the
+        # 机构 label or where the label was not extracted.
+        if profile.company is not None and profile.company.url:
+            try:
+                company_clean_url = _strip_query(profile.company.url)
+                company_profile = CompanyProfile(
+                    company_url=company_clean_url,
+                    company_slug=_url_segment(company_clean_url, "company"),
+                    name=profile.company.name or None,
+                )
+                profile.company_id = self.profile_db.upsert_company(company_profile)
+            except Exception as e:
+                self.logger.debug(
+                    "Failed to upsert company for album %s: %s", clean_url, e
+                )
+
+        if profile.company_id is None and self._current_company_id is not None:
+            profile.company_id = self._current_company_id
+
         try:
             album_id = self.profile_db.upsert_album(profile)
             self.logger.info(
-                "Persisted album profile: %s (id=%d, scraped=%d/%s, models=%d, tags=%d)",
+                "Persisted album profile: %s (id=%d, scraped=%d/%s, "
+                "company=%s, volume=%s, models=%d, tags=%d)",
                 profile.title or profile.album_slug or profile.album_url,
                 album_id,
                 profile.scraped_photo_count,
                 profile.listed_photo_count,
+                profile.company.name if profile.company else None,
+                profile.volume_number,
                 len(profile.models),
                 len(profile.tags),
             )

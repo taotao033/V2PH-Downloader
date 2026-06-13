@@ -1,4 +1,4 @@
-"""Actor / album profile extraction and SQLite persistence.
+"""Actor / album / company profile extraction and SQLite persistence.
 
 This module is independent of the rest of the scraper; it only takes
 parsed HTML trees (lxml) and produces typed dataclasses that can be
@@ -7,11 +7,14 @@ upserted into a SQLite database with the schema defined below.
 Schema (see ``ProfileDB.SCHEMA``):
 
     actors       - one row per actor URL (e.g. /actor/Miku-Tanaka).
+    companies    - one row per company URL (e.g. /company/MiStar).
     albums       - one row per album URL; FK ``actor_id`` ties each
-                   album back to the actor whose listing was scraped.
-                   ``actor_id`` is nullable because users can scrape an
-                   album URL directly without ever touching an actor
-                   listing.
+                   album back to the actor whose listing was scraped
+                   (nullable).  FK ``company_id`` links to the
+                   production company shown on the album page (nullable).
+                   ``volume_number`` stores the serial label (e.g.
+                   "VOL.173") and ``description`` stores the
+                   album-intro text block.
     album_models - many-to-many: an album can list multiple models,
                    each with an optional URL when the page hyperlinks
                    the model's name.
@@ -51,12 +54,18 @@ ACTOR_LABEL_MAP: dict[str, str] = {
 }
 
 ALBUM_LABEL_MAP: dict[str, str] = {
+    "日期": "release_date",
     "发行日期": "release_date", "發行日期": "release_date", "発行日": "release_date",
     "Release date": "release_date", "Release Date": "release_date",
-    "照片数量": "photo_count_text", "照片數量": "photo_count_text", "枚数": "photo_count_text",
-    "Photos": "photo_count_text", "Photo Count": "photo_count_text",
+    "照片": "photo_count_text", "照片数量": "photo_count_text", "照片數量": "photo_count_text",
+    "枚数": "photo_count_text", "Photos": "photo_count_text", "Photo Count": "photo_count_text",
+    "机构": "company_label", "機構": "company_label", "制作": "company_label",
+    "Company": "company_label",
+    "编号": "volume_number", "編號": "volume_number", "Volume": "volume_number",
+    "模特": "models_label",
     "出镜模特": "models_label", "出鏡模特": "models_label", "出演者": "models_label",
     "Models": "models_label", "Model": "models_label",
+    "标签": "tags_label", "標籤": "tags_label",
     "专辑标签": "tags_label", "專輯標籤": "tags_label", "タグ": "tags_label",
     "Tags": "tags_label", "Tag": "tags_label",
 }
@@ -85,8 +94,18 @@ class ActorProfile:
 
 
 @dataclass
+class CompanyProfile:
+    """Profile for a production company (/company/<slug>)."""
+
+    company_url: str
+    company_slug: Optional[str] = None
+    name: Optional[str] = None
+    listed_album_count: Optional[int] = None
+
+
+@dataclass
 class AlbumLink:
-    """Name + optional href, shared by album_models and album_tags."""
+    """Name + optional href, shared by album_models, album_tags, and company."""
 
     name: str
     url: Optional[str] = None
@@ -101,9 +120,13 @@ class AlbumProfile:
     listed_photo_count: Optional[int] = None
     scraped_photo_count: int = 0
     actor_id: Optional[int] = None
+    company_id: Optional[int] = None       # FK to companies; set by manager
+    volume_number: Optional[str] = None    # e.g. "VOL.173"
+    description: Optional[str] = None     # album-intro text block
     download_dest: Optional[str] = None
     models: list[AlbumLink] = field(default_factory=list)
     tags: list[AlbumLink] = field(default_factory=list)
+    company: Optional[AlbumLink] = None    # transient; used to populate company_id
 
 
 # --------------------------------------------------------------------------- #
@@ -141,6 +164,17 @@ class ProfileDB:
         last_updated_at     TEXT    NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS companies (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_url         TEXT    NOT NULL UNIQUE,
+        company_slug        TEXT,
+        name                TEXT,
+        listed_album_count  INTEGER,
+        scraped_album_count INTEGER NOT NULL DEFAULT 0,
+        first_seen_at       TEXT    NOT NULL,
+        last_updated_at     TEXT    NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS albums (
         id                   INTEGER PRIMARY KEY AUTOINCREMENT,
         album_url            TEXT    NOT NULL UNIQUE,
@@ -150,10 +184,14 @@ class ProfileDB:
         listed_photo_count   INTEGER,
         scraped_photo_count  INTEGER NOT NULL DEFAULT 0,
         actor_id             INTEGER,
+        company_id           INTEGER,
+        volume_number        TEXT,
+        description          TEXT,
         download_dest        TEXT,
         first_seen_at        TEXT    NOT NULL,
         last_updated_at      TEXT    NOT NULL,
-        FOREIGN KEY (actor_id) REFERENCES actors(id) ON DELETE SET NULL
+        FOREIGN KEY (actor_id)   REFERENCES actors(id)    ON DELETE SET NULL,
+        FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS album_models (
@@ -203,6 +241,7 @@ class ProfileDB:
         self.db_path = str(db_path)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self._migrate_schema()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -217,6 +256,38 @@ class ProfileDB:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(self.SCHEMA)
+
+    def _migrate_schema(self) -> None:
+        """Add columns introduced after the initial release to existing DBs.
+
+        SQLite does not support ``ALTER TABLE … ADD COLUMN IF NOT EXISTS``,
+        so we attempt each ALTER and swallow the OperationalError that fires
+        when the column already exists.
+        """
+        new_cols: list[tuple[str, str, str]] = [
+            # albums – new fields added in this release
+            ("albums", "company_id",    "INTEGER REFERENCES companies(id) ON DELETE SET NULL"),
+            ("albums", "volume_number", "TEXT"),
+            ("albums", "description",   "TEXT"),
+            # companies – columns added after the initial companies table
+            ("companies", "listed_album_count",  "INTEGER"),
+            ("companies", "scraped_album_count", "INTEGER NOT NULL DEFAULT 0"),
+        ]
+        with self._connect() as conn:
+            for table, col, col_def in new_cols:
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # column already present
+
+            # idx_albums_company must be created AFTER company_id exists,
+            # so it lives here rather than in SCHEMA (which runs before the
+            # ALTER TABLE migrations above).
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_albums_company ON albums(company_id)"
+            )
+            conn.commit()
 
     # -- actors -------------------------------------------------------------
     def upsert_actor(self, p: ActorProfile) -> int:
@@ -302,6 +373,63 @@ class ProfileDB:
             )
             conn.commit()
 
+    # -- companies ----------------------------------------------------------
+    def upsert_company(self, p: CompanyProfile) -> int:
+        """Insert or merge a company row, returning its primary key.
+
+        Existing fields are preserved when the new payload's value is
+        ``None`` so a partial re-scrape never blanks previously
+        captured data.
+        """
+        now = _now_iso()
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM companies WHERE company_url = ?", (p.company_url,))
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    """
+                    INSERT INTO companies (
+                        company_url, company_slug, name, listed_album_count,
+                        first_seen_at, last_updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (p.company_url, p.company_slug, p.name, p.listed_album_count, now, now),
+                )
+                conn.commit()
+                return int(cur.lastrowid or 0)
+
+            company_id = int(row["id"])
+            cur.execute(
+                """
+                UPDATE companies SET
+                    company_slug        = COALESCE(?, company_slug),
+                    name                = COALESCE(?, name),
+                    listed_album_count  = COALESCE(?, listed_album_count),
+                    last_updated_at     = ?
+                WHERE id = ?
+                """,
+                (p.company_slug, p.name, p.listed_album_count, now, company_id),
+            )
+            conn.commit()
+            return company_id
+
+    def get_company_by_url(self, company_url: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM companies WHERE company_url = ?", (company_url,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def update_company_scraped_album_count(self, company_id: int, count: int) -> None:
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE companies SET scraped_album_count = ?, last_updated_at = ? WHERE id = ?",
+                (count, now, company_id),
+            )
+            conn.commit()
+
     # -- albums -------------------------------------------------------------
     def upsert_album(self, p: AlbumProfile) -> int:
         """Upsert an album plus its models / tags.
@@ -323,12 +451,14 @@ class ProfileDB:
                     INSERT INTO albums (
                         album_url, album_slug, title, release_date,
                         listed_photo_count, scraped_photo_count, actor_id,
+                        company_id, volume_number, description,
                         download_dest, first_seen_at, last_updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         p.album_url, p.album_slug, p.title, p.release_date,
                         p.listed_photo_count, p.scraped_photo_count, p.actor_id,
+                        p.company_id, p.volume_number, p.description,
                         p.download_dest, now, now,
                     ),
                 )
@@ -344,6 +474,9 @@ class ProfileDB:
                         listed_photo_count  = COALESCE(?, listed_photo_count),
                         scraped_photo_count = ?,
                         actor_id            = COALESCE(?, actor_id),
+                        company_id          = COALESCE(?, company_id),
+                        volume_number       = COALESCE(?, volume_number),
+                        description         = COALESCE(?, description),
                         download_dest       = COALESCE(?, download_dest),
                         last_updated_at     = ?
                     WHERE id = ?
@@ -351,7 +484,8 @@ class ProfileDB:
                     (
                         p.album_slug, p.title, p.release_date,
                         p.listed_photo_count, p.scraped_photo_count,
-                        p.actor_id, p.download_dest, now, album_id,
+                        p.actor_id, p.company_id, p.volume_number, p.description,
+                        p.download_dest, now, album_id,
                     ),
                 )
 
@@ -554,8 +688,19 @@ class ProfileExtractor:
             kv = cls._extract_label_values(tree, ALBUM_LABEL_MAP)
             profile.release_date = kv.get("release_date")
             profile.listed_photo_count = _parse_photo_count(kv.get("photo_count_text"))
+            profile.volume_number = kv.get("volume_number")
         except Exception as e:
             logger.debug("album kv extraction failed for %s: %s", album_url, e)
+
+        try:
+            company_links = cls._extract_label_links(
+                tree,
+                _labels_for_canonical(ALBUM_LABEL_MAP, "company_label"),
+                base_url=album_url,
+            )
+            profile.company = company_links[0] if company_links else None
+        except Exception as e:
+            logger.debug("album company extraction failed for %s: %s", album_url, e)
 
         try:
             profile.models = cls._extract_label_links(
@@ -574,6 +719,41 @@ class ProfileExtractor:
             )
         except Exception as e:
             logger.debug("album tags extraction failed for %s: %s", album_url, e)
+
+        try:
+            profile.description = cls._extract_album_description(tree)
+        except Exception as e:
+            logger.debug("album description extraction failed for %s: %s", album_url, e)
+
+        return profile
+
+    @classmethod
+    def extract_company(cls, tree: html.HtmlElement, company_url: str) -> CompanyProfile:
+        """Extract company metadata from a /company/<slug> listing page.
+
+        Reuses the same name and album-count helpers as actor pages - the
+        v2ph layout for company pages is structurally identical (h1/h2
+        title + "已收录 N 套写真集" count block + album thumbnail grid).
+        """
+        clean_url = _strip_query(company_url)
+        profile = CompanyProfile(
+            company_url=clean_url,
+            company_slug=_url_segment(clean_url, "company"),
+        )
+        if tree is None:
+            return profile
+
+        try:
+            profile.name = cls._extract_name(tree)
+        except Exception as e:
+            logger.debug("company name extraction failed for %s: %s", company_url, e)
+
+        try:
+            profile.listed_album_count = cls._extract_listed_album_count(tree)
+        except Exception as e:
+            logger.debug(
+                "company listed_album_count extraction failed for %s: %s", company_url, e
+            )
 
         return profile
 
@@ -718,6 +898,31 @@ class ProfileExtractor:
                 break
 
         return results
+
+    @staticmethod
+    def _extract_album_description(tree: html.HtmlElement) -> Optional[str]:
+        """Extract the album-intro paragraph rendered below the metadata table.
+
+        v2ph wraps this text in ``<div class="album-intro …">`` with no
+        inner tags. Falls back to the ``og:description`` / ``description``
+        meta when that div is absent (older page snapshots).
+        """
+        for node in tree.xpath("//div[contains(@class, 'album-intro')]"):
+            text = " ".join(t.strip() for t in node.itertext() if t and t.strip())
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                return text
+
+        for xp in (
+            "//meta[@property='og:description']/@content",
+            "//meta[@name='description']/@content",
+        ):
+            for raw in tree.xpath(xp):
+                text = re.sub(r"\s+", " ", str(raw or "")).strip()
+                if text:
+                    return text
+
+        return None
 
     @staticmethod
     def _extract_bio(tree: html.HtmlElement) -> Optional[str]:
@@ -931,6 +1136,7 @@ __all__ = [
     "ActorProfile",
     "AlbumLink",
     "AlbumProfile",
+    "CompanyProfile",
     "ProfileDB",
     "ProfileExtractor",
 ]

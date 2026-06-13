@@ -16,7 +16,7 @@ from pathvalidate import sanitize_filename
 from v2dl.common import Config
 from v2dl.common.const import BASE_URL, HEADERS, IMAGE_PER_PAGE, VALID_EXTENSIONS
 from v2dl.scraper.downloader import DirectoryCache, DownloadPathTool
-from v2dl.scraper.profiles import ActorProfile, AlbumProfile, ProfileExtractor
+from v2dl.scraper.profiles import ActorProfile, AlbumProfile, CompanyProfile, ProfileExtractor
 from v2dl.scraper.tools import AlbumTracker, DownloadStatus, LogKey, UrlHandler
 from v2dl.scraper.types import AlbumResult, ImageResult, PageResultType
 
@@ -235,6 +235,11 @@ class AlbumScraper(BaseScraper[AlbumResult]):
         # after ``scrape_all_pages`` completes so it can persist the
         # profile and link subsequent album rows to the actor.
         self.last_actor_profile: ActorProfile | None = None
+        # Most recently captured company profile (only populated when the
+        # listing URL is /company/<slug>, i.e. a specific company page –
+        # NOT the /company/ index). Cleared between listings by the
+        # manager, same pattern as last_actor_profile.
+        self.last_company_profile: CompanyProfile | None = None
         self._last_listing_url: str | None = None
 
     def get_xpath(self) -> str:
@@ -271,6 +276,20 @@ class AlbumScraper(BaseScraper[AlbumResult]):
                 self._last_listing_url = url
             except Exception as e:
                 self.logger.debug("Actor profile extraction failed for %s: %s", url, e)
+
+        # Capture the company profile once, on the first page of a
+        # /company/<slug> listing (not the bare /company/ index page).
+        # ``/company/`` with no further slug has no slug segment after
+        # stripping the query, so the segment check excludes it.
+        if self.last_company_profile is None and "/company/" in url:
+            from v2dl.scraper.profiles import _url_segment  # avoid circular at module level
+            slug = _url_segment(url.split("?", 1)[0], "company")
+            if slug:  # non-empty slug = specific company page, not the index
+                try:
+                    self.last_company_profile = ProfileExtractor.extract_company(tree, url)
+                    self._last_listing_url = url
+                except Exception as e:
+                    self.logger.debug("Company profile extraction failed for %s: %s", url, e)
 
         page_result.extend([BASE_URL + album_link for album_link in page_links])
         self.logger.info("Found %d albums on page %d", len(page_links), page_num)

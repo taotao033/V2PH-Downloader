@@ -14,6 +14,8 @@ V2PH-Downloader 的本地归档辅助脚本。
 | --------------------- | -------------------------------------------------------------------------- |
 | `sync_local.py`       | 主管道：`discover`（构建监视列表） + `sync`（驱动 v2dl 下载）              |
 | `sync_actors_profile.py` | 把 `data/sync/actors.xlsx` 里的演员**逐个采集 profile + 头像**入库；已完成的自动跳过。用来"先看脸再挑订阅"。 |
+| `sync_companies_profile.py` | 把 `data/sync/companies.xlsx` 里的机构信息**批量写入** profile DB；不需要网络。 |
+| `backfill_album_profiles.py` | 为 DB 中已有的相册行（旧版本下载、缺少 company / volume_number / description 字段）**补齐新字段**，逐一重新抓第 1 页再 upsert。 |
 | `v2dl-sync.ps1`       | 给 Windows 任务计划程序用的 PowerShell 薄封装，套在 `sync_local.py` 之上   |
 | `smoke_profiles.py`   | 单元级 smoke：合成 HTML（**镜像真实 v2ph DOM**）→ 解析 → 写入 / 读出 SQLite |
 | `smoke_manager.py`    | 端到端 smoke：用 FakeBot 跑通 `ScrapeManager`，覆盖正常路径 + backfill 路径 |
@@ -411,6 +413,42 @@ Register-ScheduledTask -TaskName "v2dl-sync-daily" -Action $action -Trigger $tri
 7. 用 `sync --input data/sync/actors.xlsx --mode full` 跑演员维度的同步，把刚才挑出来的人专辑都下下来。
 8. CDN 中断或个别相册不完整时，加 `--force-download` 再跑一轮（已完整的不会重下）。
 9. 把整套 `sync` 命令塞进 `v2dl-sync.ps1` 用任务计划程序定时跑。
+
+---
+
+## 历史相册补全新字段：`backfill_album_profiles.py`
+
+v2dl 旧版本未采集机构（company）、相册编号（volume_number）、描述（description）。
+这三个字段在新版 `profiles.py` 中已支持，`backfill_album_profiles.py` 用来给已入库的相册**补齐这些数据**，原理：
+
+1. 查询 profile DB 中 `company_id / volume_number / description` **全为 NULL** 的相册行。
+2. 逐条抓第 1 页（借助同款 Cloudflare 绕过机制），重新 `extract_album`。
+3. 如果页面有机构链接，先 upsert 机构行，再把 `company_id` FK 写到相册行。
+4. `upsert_album` 使用 COALESCE —— 已有的正确值**不会被覆盖**；`scraped_photo_count` 从 DB 现有行读取再写回，**不会归零**。
+
+### 常用命令
+
+```powershell
+# 先 dry-run 看看有多少条待处理
+python scripts\backfill_album_profiles.py -d "D:\v2ph_archive" --dry-run
+
+# 先跑一小批（50 条）试试水、验证提取正确
+python scripts\backfill_album_profiles.py -d "D:\v2ph_archive" --limit 50
+
+# 全量跑（3000+ 条，每条默认 sleep 3s，需要几小时，可分多次 --limit 运行）
+python scripts\backfill_album_profiles.py -d "D:\v2ph_archive"
+
+# 手动指定 sleep 间隔（降到 2s）
+python scripts\backfill_album_profiles.py -d "D:\v2ph_archive" --sleep 2
+
+# 强制重新 upsert 已有字段的相册（安全，COALESCE 不会覆盖正确值）
+python scripts\backfill_album_profiles.py -d "D:\v2ph_archive" --force
+
+# 自定义 DB 路径
+python scripts\backfill_album_profiles.py -d "D:\v2ph_archive" --db "E:\custom.sqlite3"
+```
+
+> **提示**：可以随时 Ctrl+C 中断，下次再跑会自动跳过已经填好字段的相册（无需 --force）。
 
 ---
 
