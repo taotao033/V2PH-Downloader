@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}{{ t('pricing.title') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+<div class="pricing-head">
+  <h1>{{ t('pricing.title') }}</h1>
+  <p>{{ t('pricing.subtitle') }}</p>
+</div>
+
+<div class="pricing-grid">
+  {% for key, spec in PLANS.items() %}
+  <div class="plan-card {{ 'featured' if key == 'year' }}">
+    {% if key == 'year' %}<div class="plan-ribbon">BEST</div>{% endif %}
+    <h3>{{ t('pricing.' ~ key) }}</h3>
+    <div class="plan-price">¥{{ spec.price }}<span>/ {{ spec.days }} {{ t('pricing.days') }}</span></div>
+    <ul class="plan-feats">
+      <li><i class="bi bi-check-lg"></i> {{ t('pricing.feat_full') }}</li>
+      <li><i class="bi bi-check-lg"></i> {{ t('pricing.feat_zip') }}</li>
+      <li><i class="bi bi-check-lg"></i> {{ t('pricing.feat_nolimit') }}</li>
+      <li><i class="bi bi-check-lg"></i> {{ t('pricing.feat_priority') }}</li>
+    </ul>
+    <a class="btn btn-vip w-100" href="{{ url_for('subscribe', plan=key, next=nxt) }}">{{ t('pricing.subscribe') }}</a>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

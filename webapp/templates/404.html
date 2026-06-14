@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}404 · {{ SITE_NAME }}{% endblock %}
+{% block content %}
+<div class="empty-state big">
+  {% if forbidden %}
+  <i class="bi bi-shield-lock"></i>
+  <h2>403</h2>
+  <p>{{ t('page.403') }}</p>
+  {% else %}
+  <i class="bi bi-compass"></i>
+  <h2>404</h2>
+  <p>{{ t('page.404') }}</p>
+  {% endif %}
+  <a class="btn btn-outline-accent" href="{{ url_for('index') }}">{{ t('page.back_home') }}</a>
+</div>
+{% endblock %}

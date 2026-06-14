@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}{{ t('account.title') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+<div class="account-wrap">
+  <h1>{{ t('account.title') }}</h1>
+
+  <div class="account-card">
+    <div class="account-row">
+      <span class="ac-label">{{ t('auth.username') }}</span>
+      <span class="ac-value">{{ current_user['username'] }}</span>
+    </div>
+    <div class="account-row">
+      <span class="ac-label">{{ t('auth.email') }}</span>
+      <span class="ac-value">{{ current_user['email'] }}</span>
+    </div>
+    <div class="account-row">
+      <span class="ac-label">{{ t('account.member') }}</span>
+      <span class="ac-value">
+        {% if is_vip %}
+          <span class="vip-badge">VIP</span> {{ t('account.vip') }}
+        {% else %}
+          {{ t('account.free') }}
+        {% endif %}
+      </span>
+    </div>
+    {% if is_vip and current_user['plan_expires'] %}
+    <div class="account-row">
+      <span class="ac-label">{{ t('account.expires') }}</span>
+      <span class="ac-value">{{ current_user['plan_expires'].split('T')[0] }}</span>
+    </div>
+    {% endif %}
+    <div class="account-row">
+      <span class="ac-label">{{ t('account.joined') }}</span>
+      <span class="ac-value">{{ current_user['created_at'].split('T')[0] }}</span>
+    </div>
+    <a class="btn btn-vip mt-3" href="{{ url_for('pricing') }}"><i class="bi bi-gem"></i> {{ t('account.upgrade') }}</a>
+  </div>
+
+  <h2 class="orders-head">{{ t('account.orders') }}</h2>
+  {% if orders %}
+  <table class="table orders-table">
+    <thead>
+      <tr>
+        <th>{{ t('order.plan') }}</th>
+        <th>{{ t('order.amount') }}</th>
+        <th>{{ t('order.date') }}</th>
+        <th>{{ t('order.status') }}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for o in orders %}
+      <tr>
+        <td>{{ t('pricing.' ~ o['plan']) }}</td>
+        <td>¥{{ '%.0f'|format(o['amount']) }}</td>
+        <td>{{ o['created_at'].replace('T',' ') }}</td>
+        <td><span class="badge bg-success">{{ t('order.paid') }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="text-muted">{{ t('account.no_orders') }}</p>
+  {% endif %}
+</div>
+{% endblock %}

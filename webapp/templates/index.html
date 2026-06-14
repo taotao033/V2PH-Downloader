@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% from "_macros.html" import album_card, model_card, section_head %}
+
+{% block content %}
+<section class="hero">
+  <div class="hero-inner">
+    <h1>{{ t('home.hero_title') }}</h1>
+    <p class="hero-stats">
+      {{ t('home.stats').format(
+           albums=stats.albums|groupthousands,
+           models=stats.models|groupthousands,
+           photos=stats.photos|groupthousands,
+           vendors=stats.vendors|groupthousands) }}
+    </p>
+  </div>
+</section>
+
+{{ section_head(t('home.featured'), 'bi-stars') }}
+<div class="row g-3">
+  {% for a in featured %}{{ album_card(a) }}{% endfor %}
+</div>
+
+{{ section_head(t('home.latest'), 'bi-clock-history') }}
+<div class="row g-3">
+  {% for a in latest %}{{ album_card(a) }}{% endfor %}
+</div>
+<div class="text-center mt-3">
+  <a class="btn btn-outline-accent" href="{{ url_for('models') }}">{{ t('home.browse_all') }} <i class="bi bi-arrow-right"></i></a>
+</div>
+
+{{ section_head(t('home.hot_models'), 'bi-people') }}
+<div class="row g-3">
+  {% for m in hot_models %}{{ model_card(m) }}{% endfor %}
+</div>
+
+{{ section_head(t('home.hot_tags'), 'bi-tags') }}
+<div class="tag-cloud">
+  {% for tg in hot_tags %}
+    <a href="{{ url_for('tag', name=tg['tag_name']) }}" class="cloud-chip">
+      {{ tg['tag_name'] }} <span>{{ tg['n'] }}</span>
+    </a>
+  {% endfor %}
+</div>
+{% endblock %}

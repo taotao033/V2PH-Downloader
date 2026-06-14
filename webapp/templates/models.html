@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% from "_macros.html" import model_card, pager, section_head %}
+{% block title %}{{ t('models.title') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+{{ section_head(t('models.title') ~ ' (' ~ pg.total|string ~ ')', 'bi-people') }}
+
+<div class="filter-bar">
+  <div class="region-filters">
+    <a href="{{ url_for('models') }}" class="rf {{ 'active' if not region }}">{{ t('models.all') }}</a>
+    {% for key, label in REGION_LABELS.items() %}
+      <a href="{{ url_for('models', region=key) }}" class="rf {{ 'active' if region == key }}">{{ t('region.' ~ key) }}</a>
+    {% endfor %}
+  </div>
+  <form class="sort-form" method="get">
+    {% if region %}<input type="hidden" name="region" value="{{ region }}">{% endif %}
+    {% if search %}<input type="hidden" name="q" value="{{ search }}">{% endif %}
+    <select name="sort" class="form-select form-select-sm" onchange="this.form.submit()">
+      <option value="albums" {{ 'selected' if order=='albums' }}>{{ t('sort.albums') }}</option>
+      <option value="name" {{ 'selected' if order=='name' }}>{{ t('sort.name') }}</option>
+      <option value="recent" {{ 'selected' if order=='recent' }}>{{ t('sort.recent') }}</option>
+    </select>
+  </form>
+</div>
+
+{% if actors %}
+<div class="row g-3" id="grid" data-partial="models" data-page="{{ pg.page }}" data-pages="{{ pg.pages }}">
+  {% include "partials/models.html" %}
+</div>
+{% if pg.pages > 1 %}
+<div class="load-more-wrap"><button id="loadMore" class="btn btn-outline-accent">{{ t('common.load_more') }}</button></div>
+{% endif %}
+{% else %}
+<div class="empty-state"><i class="bi bi-person-x"></i><p>{{ t('models.none') }}</p></div>
+{% endif %}
+{% endblock %}

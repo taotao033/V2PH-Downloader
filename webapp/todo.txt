@@ -1,0 +1,3 @@
+todo (all done):
+[x] 3. local password reset (one-time token to console) + CLI reset tool
+       (SMTP email / real payment sandbox left out — both need external credentials)

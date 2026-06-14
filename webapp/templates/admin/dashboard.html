@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% from "_macros.html" import section_head %}
+{% block title %}{{ t('admin.title') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+{{ section_head(t('admin.title'), 'bi-speedometer2') }}
+
+<div class="admin-tabs">
+  <a href="{{ url_for('admin_dashboard') }}" class="at active">{{ t('admin.dashboard') }}</a>
+  <a href="{{ url_for('admin_users') }}" class="at">{{ t('admin.users') }}</a>
+</div>
+
+<div class="admin-stats">
+  <div class="astat"><i class="bi bi-people"></i><span class="num">{{ stats.users }}</span><span class="lbl">{{ t('admin.stat_users') }}</span></div>
+  <div class="astat"><i class="bi bi-gem"></i><span class="num">{{ stats.vip }}</span><span class="lbl">{{ t('admin.stat_vip') }}</span></div>
+  <div class="astat"><i class="bi bi-receipt"></i><span class="num">{{ stats.orders }}</span><span class="lbl">{{ t('admin.stat_orders') }}</span></div>
+  <div class="astat"><i class="bi bi-cash-coin"></i><span class="num">¥{{ '%.0f'|format(stats.revenue) }}</span><span class="lbl">{{ t('admin.stat_revenue') }}</span></div>
+</div>
+{% endblock %}

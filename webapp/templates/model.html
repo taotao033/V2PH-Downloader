@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% from "_macros.html" import album_card, pager, section_head %}
+{% block title %}{{ actor['name'] }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+<div class="profile-header">
+  <div class="profile-avatar">
+    <img src="{{ actor|avatar }}" alt="{{ actor['name'] }}">
+  </div>
+  <div class="profile-body">
+    <div class="profile-title-row">
+      <h1>{{ actor['name'] or actor['actor_slug'] }}</h1>
+      <button class="fav-btn fav-btn-round {{ 'is-fav' if is_fav }}" data-kind="actor" data-slug="{{ actor['actor_slug'] }}"
+              data-login="{{ 'yes' if current_user else 'no' }}" data-login-url="{{ url_for('login', next=request.path) }}"
+              title="{{ t('fav.add') }}">
+        <i class="bi {{ 'bi-heart-fill' if is_fav else 'bi-heart' }}"></i>
+      </button>
+    </div>
+    <dl class="profile-fields">
+      {% if actor['birthday'] %}<div><dt>{{ t('model.birthday') }}</dt><dd>{{ actor['birthday'] }}</dd></div>{% endif %}
+      {% if actor['height'] %}<div><dt>{{ t('model.height') }}</dt><dd>{{ actor['height'] }} cm</dd></div>{% endif %}
+      {% if actor['from_location'] %}<div><dt>{{ t('model.from') }}</dt><dd>{{ actor['from_location'] }}</dd></div>{% endif %}
+      {% if actor['zodiac'] %}<div><dt>{{ t('model.zodiac') }}</dt><dd>{{ actor['zodiac'] }}</dd></div>{% endif %}
+      {% if actor['blood_type'] %}<div><dt>{{ t('model.blood') }}</dt><dd>{{ actor['blood_type'] }}</dd></div>{% endif %}
+      {% if actor['profession'] %}<div><dt>{{ t('model.profession') }}</dt><dd>{{ actor['profession'] }}</dd></div>{% endif %}
+      {% if actor['hobbies'] %}<div><dt>{{ t('model.hobbies') }}</dt><dd>{{ actor['hobbies'] }}</dd></div>{% endif %}
+      <div><dt>{{ t('model.collected') }}</dt><dd>{{ pg.total }}</dd></div>
+    </dl>
+    {% if actor['bio'] %}<p class="profile-bio">{{ actor['bio'] }}</p>{% endif %}
+  </div>
+</div>
+
+{{ section_head(t('model.albums'), 'bi-collection') }}
+{% if albums %}
+<div class="row g-3" id="grid" data-partial="albums" data-page="{{ pg.page }}" data-pages="{{ pg.pages }}">
+  {% include "partials/albums.html" %}
+</div>
+{% if pg.pages > 1 %}
+<div class="load-more-wrap"><button id="loadMore" class="btn btn-outline-accent">{{ t('common.load_more') }}</button></div>
+{% endif %}
+{% else %}
+<div class="empty-state"><i class="bi bi-folder-x"></i><p>{{ t('model.no_albums') }}</p></div>
+{% endif %}
+{% endblock %}

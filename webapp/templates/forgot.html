@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}{{ t('reset.forgot_title') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+<div class="auth-card">
+  <h1>{{ t('reset.forgot_title') }}</h1>
+  {% if sent %}
+  <div class="alert alert-success">{{ t('reset.sent') }}</div>
+  <p class="auth-switch"><a href="{{ url_for('login') }}">{{ t('auth.login') }}</a></p>
+  {% else %}
+  <p class="text-muted">{{ t('reset.forgot_desc') }}</p>
+  <form method="post" action="{{ url_for('forgot') }}">
+    <div class="mb-3">
+      <label class="form-label">{{ t('auth.username') }} / {{ t('auth.email') }}</label>
+      <input type="text" name="login" class="form-control" required autofocus>
+    </div>
+    <button type="submit" class="btn btn-vip w-100">{{ t('reset.send') }}</button>
+  </form>
+  <p class="auth-switch"><a href="{{ url_for('login') }}">{{ t('auth.login') }}</a></p>
+  {% endif %}
+</div>
+{% endblock %}

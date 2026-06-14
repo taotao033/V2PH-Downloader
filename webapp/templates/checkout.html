@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}{{ t('checkout.title') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+<div class="auth-card">
+  <h1>{{ t('checkout.title') }}</h1>
+  <div class="checkout-summary">
+    <div class="account-row"><span class="ac-label">{{ t('checkout.plan') }}</span><span class="ac-value">{{ t('pricing.' ~ plan) }}</span></div>
+    <div class="account-row"><span class="ac-label">{{ t('checkout.duration') }}</span><span class="ac-value">{{ spec.days }} {{ t('pricing.days') }}</span></div>
+    <div class="account-row"><span class="ac-label">{{ t('checkout.price') }}</span><span class="ac-value price-big">¥{{ spec.price }}</span></div>
+  </div>
+  <form method="post" action="{{ url_for('subscribe', plan=plan, next=nxt) }}">
+    <button type="submit" class="btn btn-vip btn-lg w-100"><i class="bi bi-credit-card"></i> {{ t('checkout.pay') }}</button>
+  </form>
+  <p class="checkout-note"><i class="bi bi-info-circle"></i> {{ t('checkout.note') }}</p>
+</div>
+{% endblock %}

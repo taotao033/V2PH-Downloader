@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pager, album_card, section_head %}
+{% block title %}{{ album['title'] }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb v2-crumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('index') }}">{{ t('nav.home') }}</a></li>
+    {% if album['company_name'] %}
+    <li class="breadcrumb-item"><a href="{{ url_for('vendor', slug=album['company_slug']) }}">{{ album['company_name'] }}</a></li>
+    {% endif %}
+    <li class="breadcrumb-item active">{{ t('album.crumb') }}</li>
+  </ol>
+</nav>
+
+<div class="album-header">
+  <h1 class="album-title">{{ album['title'] }}</h1>
+  <div class="album-info">
+    {% if album['actor_name'] %}
+      <a href="{{ url_for('model', slug=album['actor_slug']) }}" class="info-pill"><i class="bi bi-person-circle"></i> {{ album['actor_name'] }}</a>
+    {% endif %}
+    {% if album['company_name'] %}
+      <a href="{{ url_for('vendor', slug=album['company_slug']) }}" class="info-pill"><i class="bi bi-building"></i> {{ album['company_name'] }}</a>
+    {% endif %}
+    {% if album['release_date'] %}<span class="info-pill"><i class="bi bi-calendar3"></i> {{ album['release_date'] }}</span>{% endif %}
+    <span class="info-pill"><i class="bi bi-images"></i> {{ photo_total }}P</span>
+    {% if photo_total %}
+      <a class="info-pill pill-download" href="{{ url_for('album_download', slug=album['album_slug']) }}"><i class="bi bi-download"></i> {{ t('album.download') }}</a>
+    {% endif %}
+    <button class="info-pill fav-btn {{ 'is-fav' if is_fav }}" data-kind="album" data-slug="{{ album['album_slug'] }}"
+            data-login="{{ 'yes' if current_user else 'no' }}" data-login-url="{{ url_for('login', next=request.path) }}">
+      <i class="bi {{ 'bi-heart-fill' if is_fav else 'bi-heart' }}"></i>
+      <span class="fav-label">{{ t('fav.added') if is_fav else t('fav.add') }}</span>
+    </button>
+  </div>
+  {% if models %}
+  <div class="album-people">
+    {% for m in models %}
+      {% if m['actor_slug'] %}
+        <a href="{{ url_for('model', slug=m['actor_slug']) }}" class="people-chip">{{ m['model_name'] }}</a>
+      {% else %}
+        <span class="people-chip muted">{{ m['model_name'] }}</span>
+      {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% if tags %}
+  <div class="album-tags">
+    {% for tg in tags %}<a href="{{ url_for('tag', name=tg['tag_name']) }}" class="tag-chip">#{{ tg['tag_name'] }}</a>{% endfor %}
+  </div>
+  {% endif %}
+  {% if album['description'] %}<p class="album-desc">{{ album['description'] }}</p>{% endif %}
+</div>
+
+{% if photos %}
+<div class="photo-toolbar">
+  <span class="pt-label">{{ t('view.label') }}</span>
+  <div class="view-switch" role="group" aria-label="{{ t('view.label') }}">
+    <button type="button" class="vsw" data-view="masonry" title="{{ t('view.masonry') }}" aria-label="{{ t('view.masonry') }}"><i class="bi bi-columns-gap"></i></button>
+    <button type="button" class="vsw" data-view="grid" title="{{ t('view.grid') }}" aria-label="{{ t('view.grid') }}"><i class="bi bi-grid-3x3-gap-fill"></i></button>
+    <button type="button" class="vsw" data-view="single" title="{{ t('view.single') }}" aria-label="{{ t('view.single') }}"><i class="bi bi-card-image"></i></button>
+  </div>
+</div>
+<div class="photo-grid view-masonry" id="photoGrid">
+  {% for src in photos %}
+    <a class="photo-item" href="{{ src }}" data-index="{{ loop.index }}">
+      <img loading="lazy" src="{{ src }}" alt="photo {{ loop.index }}">
+    </a>
+  {% endfor %}
+</div>
+
+{% if locked %}
+<div class="paywall">
+  <i class="bi bi-gem"></i>
+  <h3>{{ t('paywall.title') }}</h3>
+  <p>{{ t('paywall.desc').format(n=preview_n, total=photo_total) }}</p>
+  <a class="btn btn-vip btn-lg" href="{{ url_for('pricing', next=request.path) }}">
+    <i class="bi bi-unlock"></i> {{ t('paywall.cta') }}
+  </a>
+</div>
+{% else %}
+{{ pager(pg, 'album', {'slug': album['album_slug']}) }}
+{% endif %}
+
+{% else %}
+<div class="empty-state">
+  <i class="bi bi-image"></i>
+  <p>{{ t('album.no_photos') }}</p>
+</div>
+{% endif %}
+
+{% if related %}
+{{ section_head(t('album.related'), 'bi-collection') }}
+<div class="row g-3">
+  {% for a in related %}{{ album_card(a) }}{% endfor %}
+</div>
+{% endif %}
+
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lb-close" aria-label="close">&times;</button>
+  <button class="lb-prev" aria-label="prev">&#10094;</button>
+  <img id="lbImg" src="" alt="">
+  <button class="lb-next" aria-label="next">&#10095;</button>
+  <div class="lb-counter" id="lbCounter"></div>
+</div>
+{% endblock %}

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="400" viewBox="0 0 300 400">
+  <rect width="300" height="400" fill="#eceef1"/>
+  <g fill="#c4c8cf">
+    <rect x="90" y="150" width="120" height="90" rx="8"/>
+    <circle cx="125" cy="180" r="12" fill="#dfe2e7"/>
+    <path d="M105 235 l30 -35 l25 25 l20 -18 l30 28 z" fill="#dfe2e7"/>
+  </g>
+  <text x="150" y="290" font-family="sans-serif" font-size="14" fill="#aab" text-anchor="middle">àb</text>
+</svg>

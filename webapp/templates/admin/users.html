@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pager, section_head %}
+{% block title %}{{ t('admin.users') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+{{ section_head(t('admin.title'), 'bi-speedometer2') }}
+
+<div class="admin-tabs">
+  <a href="{{ url_for('admin_dashboard') }}" class="at">{{ t('admin.dashboard') }}</a>
+  <a href="{{ url_for('admin_users') }}" class="at active">{{ t('admin.users') }} ({{ pg.total }})</a>
+</div>
+
+<form class="admin-search" method="get" action="{{ url_for('admin_users') }}">
+  <input type="search" name="q" class="form-control" placeholder="{{ t('admin.search_user') }}" value="{{ search or '' }}">
+  <button class="btn btn-search" type="submit"><i class="bi bi-search"></i></button>
+</form>
+
+{% if users %}
+<div class="table-responsive">
+<table class="table admin-users-table align-middle">
+  <thead>
+    <tr>
+      <th>{{ t('admin.col_id') }}</th>
+      <th>{{ t('admin.col_user') }}</th>
+      <th>{{ t('admin.col_email') }}</th>
+      <th>{{ t('admin.col_member') }}</th>
+      <th>{{ t('admin.col_expires') }}</th>
+      <th>{{ t('admin.col_role') }}</th>
+      <th>{{ t('admin.col_joined') }}</th>
+      <th class="actions-col">{{ t('admin.col_actions') }}</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for u in users %}
+    <tr>
+      <td>{{ u['id'] }}</td>
+      <td>{{ u['username'] }}</td>
+      <td class="email-cell">{{ u['email'] }}</td>
+      <td>
+        {% if is_vip(u) %}<span class="vip-badge">VIP</span>{% else %}<span class="text-muted">—</span>{% endif %}
+      </td>
+      <td class="small">{{ u['plan_expires'].split('T')[0] if u['plan_expires'] else '—' }}</td>
+      <td>
+        {% if is_admin_fn(u) %}<span class="role-admin">{{ t('admin.role_admin') }}</span>{% else %}<span class="text-muted small">{{ t('admin.role_user') }}</span>{% endif %}
+      </td>
+      <td class="small">{{ u['created_at'].split('T')[0] }}</td>
+      <td class="actions-col">
+        <div class="admin-actions">
+          <form method="post" action="{{ url_for('admin_user_vip', user_id=u['id']) }}" class="d-inline-flex gap-1">
+            <select name="action" class="form-select form-select-sm">
+              {% for key, spec in PLANS.items() %}
+              <option value="{{ key }}">{{ t('admin.grant') }} {{ t('pricing.' ~ key) }}</option>
+              {% endfor %}
+              <option value="revoke">{{ t('admin.revoke') }}</option>
+            </select>
+            <button class="btn btn-sm btn-outline-accent" type="submit"><i class="bi bi-check-lg"></i></button>
+          </form>
+          <form method="post" action="{{ url_for('admin_user_admin', user_id=u['id']) }}" class="d-inline">
+            {% if is_admin_fn(u) %}
+              <input type="hidden" name="value" value="0">
+              <button class="btn btn-sm btn-outline-secondary" type="submit"
+                      {{ 'disabled' if u['id'] == current_user['id'] }}>{{ t('admin.remove_admin') }}</button>
+            {% else %}
+              <input type="hidden" name="value" value="1">
+              <button class="btn btn-sm btn-outline-secondary" type="submit">{{ t('admin.make_admin') }}</button>
+            {% endif %}
+          </form>
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% set pargs = {} %}
+{% if search %}{% set _ = pargs.update({'q': search}) %}{% endif %}
+{{ pager(pg, 'admin_users', pargs) }}
+{% else %}
+<div class="empty-state"><i class="bi bi-person-x"></i><p>{{ t('admin.none') }}</p></div>
+{% endif %}
+{% endblock %}

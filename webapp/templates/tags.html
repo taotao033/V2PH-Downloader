@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% from "_macros.html" import section_head %}
+{% block title %}{{ t('tags.all') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+{{ section_head(t('tags.all'), 'bi-tags') }}
+<div class="tag-cloud">
+  {% for tg in tags %}
+    <a href="{{ url_for('tag', name=tg['tag_name']) }}" class="cloud-chip">
+      {{ tg['tag_name'] }} <span>{{ tg['n'] }}</span>
+    </a>
+  {% endfor %}
+</div>
+{% endblock %}

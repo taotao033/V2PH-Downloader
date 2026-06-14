@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% from "_macros.html" import album_card, pager, section_head %}
+{% block title %}#{{ tag_name }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+{{ section_head('#' ~ tag_name ~ ' (' ~ pg.total|string ~ ')', 'bi-tag') }}
+<div class="row g-3" id="grid" data-partial="albums" data-page="{{ pg.page }}" data-pages="{{ pg.pages }}">
+  {% include "partials/albums.html" %}
+</div>
+{% if pg.pages > 1 %}
+<div class="load-more-wrap"><button id="loadMore" class="btn btn-outline-accent">{{ t('common.load_more') }}</button></div>
+{% endif %}
+{% endblock %}

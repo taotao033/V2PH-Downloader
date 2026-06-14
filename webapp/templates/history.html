@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% from "_macros.html" import album_card, pager, section_head %}
+{% block title %}{{ t('history.title') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+{{ section_head(t('history.title'), 'bi-clock-history') }}
+{% if albums %}
+<div class="row g-3">{% for a in albums %}{{ album_card(a) }}{% endfor %}</div>
+{{ pager(pg, 'history', {}) }}
+{% else %}
+<div class="empty-state"><i class="bi bi-clock-history"></i><p>{{ t('history.none') }}</p></div>
+{% endif %}
+{% endblock %}

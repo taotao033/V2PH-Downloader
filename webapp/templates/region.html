@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% from "_macros.html" import model_card, pager, section_head %}
+{% block title %}{{ t('region.' ~ region_key) }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+{{ section_head(t('region.' ~ region_key) ~ ' · ' ~ t('models.title') ~ ' (' ~ pg.total|string ~ ')', 'bi-geo-alt') }}
+{% if actors %}
+<div class="row g-3" id="grid" data-partial="models" data-page="{{ pg.page }}" data-pages="{{ pg.pages }}">
+  {% include "partials/models.html" %}
+</div>
+{% if pg.pages > 1 %}
+<div class="load-more-wrap"><button id="loadMore" class="btn btn-outline-accent">{{ t('common.load_more') }}</button></div>
+{% endif %}
+{% else %}
+<div class="empty-state"><i class="bi bi-geo"></i><p>{{ t('models.none') }}</p></div>
+{% endif %}
+{% endblock %}

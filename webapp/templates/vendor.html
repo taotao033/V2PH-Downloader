@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% from "_macros.html" import album_card, pager, section_head %}
+{% block title %}{{ company['name'] }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+<div class="vendor-header">
+  <h1>{{ company['name'] or company['company_slug'] }}</h1>
+  <p class="text-muted">{{ t('vendor.local') }} {{ pg.total }} {{ t('vendors.sets') }}{% if company['listed_album_count'] %} · {{ t('vendor.onsite_total') }} {{ company['listed_album_count']|groupthousands }} {{ t('vendors.sets') }}{% endif %}</p>
+</div>
+{% if albums %}
+<div class="row g-3" id="grid" data-partial="albums" data-page="{{ pg.page }}" data-pages="{{ pg.pages }}">
+  {% include "partials/albums.html" %}
+</div>
+{% if pg.pages > 1 %}
+<div class="load-more-wrap"><button id="loadMore" class="btn btn-outline-accent">{{ t('common.load_more') }}</button></div>
+{% endif %}
+{% else %}
+<div class="empty-state"><i class="bi bi-folder-x"></i><p>{{ t('vendor.no_albums') }}</p></div>
+{% endif %}
+{% endblock %}

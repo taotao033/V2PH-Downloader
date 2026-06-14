@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}{{ t('auth.register_title') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+<div class="auth-card">
+  <h1>{{ t('auth.register_title') }}</h1>
+  <form method="post" action="{{ url_for('register', next=request.args.get('next','')) }}">
+    <div class="mb-3">
+      <label class="form-label">{{ t('auth.username') }}</label>
+      <input type="text" name="username" class="form-control" required value="{{ request.form.get('username','') }}">
+    </div>
+    <div class="mb-3">
+      <label class="form-label">{{ t('auth.email') }}</label>
+      <input type="email" name="email" class="form-control" required value="{{ request.form.get('email','') }}">
+    </div>
+    <div class="mb-3">
+      <label class="form-label">{{ t('auth.password') }}</label>
+      <input type="password" name="password" class="form-control" required minlength="6">
+    </div>
+    <div class="mb-3">
+      <label class="form-label">{{ t('auth.password2') }}</label>
+      <input type="password" name="password2" class="form-control" required minlength="6">
+    </div>
+    <button type="submit" class="btn btn-vip w-100">{{ t('auth.register') }}</button>
+  </form>
+  <p class="auth-switch"><a href="{{ url_for('login', next=request.args.get('next','')) }}">{{ t('auth.to_login') }}</a></p>
+</div>
+{% endblock %}

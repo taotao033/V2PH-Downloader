@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% from "_macros.html" import album_card, model_card, pager, section_head %}
+{% block title %}{{ t('nav.favorites') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+{{ section_head(t('nav.favorites'), 'bi-heart') }}
+
+<div class="admin-tabs">
+  <a href="{{ url_for('favorites', tab='album') }}" class="at {{ 'active' if tab == 'album' }}">{{ t('fav.albums') }} ({{ album_total }})</a>
+  <a href="{{ url_for('favorites', tab='actor') }}" class="at {{ 'active' if tab == 'actor' }}">{{ t('fav.actors') }} ({{ actor_total }})</a>
+</div>
+
+{% if tab == 'album' %}
+  {% if albums %}
+  <div class="row g-3">{% for a in albums %}{{ album_card(a) }}{% endfor %}</div>
+  {{ pager(pg, 'favorites', {'tab': 'album'}) }}
+  {% else %}
+  <div class="empty-state"><i class="bi bi-heart"></i><p>{{ t('fav.none') }}</p></div>
+  {% endif %}
+{% else %}
+  {% if actors %}
+  <div class="row g-3">{% for m in actors %}{{ model_card(m) }}{% endfor %}</div>
+  {{ pager(pg, 'favorites', {'tab': 'actor'}) }}
+  {% else %}
+  <div class="empty-state"><i class="bi bi-heart"></i><p>{{ t('fav.none') }}</p></div>
+  {% endif %}
+{% endif %}
+{% endblock %}

@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pager, section_head %}
+{% block title %}{{ t('vendors.title') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+{{ section_head(t('vendors.title') ~ ' (' ~ pg.total|string ~ ')', 'bi-building') }}
+{% if vendors %}
+<div class="vendor-grid" id="grid" data-partial="vendors" data-page="{{ pg.page }}" data-pages="{{ pg.pages }}">
+  {% include "partials/vendors.html" %}
+</div>
+{% if pg.pages > 1 %}
+<div class="load-more-wrap"><button id="loadMore" class="btn btn-outline-accent">{{ t('common.load_more') }}</button></div>
+{% endif %}
+{% else %}
+<div class="empty-state"><i class="bi bi-building-x"></i><p>{{ t('vendors.none') }}</p></div>
+{% endif %}
+{% endblock %}

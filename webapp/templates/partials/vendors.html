@@ -1,0 +1,7 @@
+{% for c in vendors %}
+<a class="vendor-card" href="{{ url_for('vendor', slug=c['company_slug']) }}">
+  <span class="vendor-name">{{ c['name'] or c['company_slug'] }}</span>
+  <span class="vendor-count">{{ c['local_count'] }} {{ t('vendors.sets') }}</span>
+  {% if c['listed_album_count'] %}<span class="vendor-total">{{ t('vendors.onsite') }} {{ c['listed_album_count']|groupthousands }}</span>{% endif %}
+</a>
+{% endfor %}

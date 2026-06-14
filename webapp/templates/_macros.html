@@ -1,0 +1,67 @@
+{% macro album_card(a) %}
+<div class="col-6 col-md-4 col-lg-3 col-xl-2">
+  <a class="album-card" href="{{ url_for('album', slug=a['album_slug']) }}">
+    <div class="thumb">
+      <img loading="lazy" src="{{ a|cover }}" alt="{{ a['title'] }}">
+      {% set count = a['scraped_photo_count'] or a['listed_photo_count'] %}
+      {% if count %}<span class="badge-count">{{ count }}P</span>{% endif %}
+    </div>
+    <div class="card-meta">
+      <div class="card-title" title="{{ a['title'] }}">{{ a['title'] }}</div>
+      <div class="card-sub">
+        {% if a['actor_name'] %}<span class="sub-actor"><i class="bi bi-person"></i> {{ a['actor_name'] }}</span>{% endif %}
+        {% if a['company_name'] %}<span class="sub-vendor">{{ a['company_name'] }}</span>{% endif %}
+      </div>
+    </div>
+  </a>
+</div>
+{% endmacro %}
+
+{% macro model_card(m) %}
+<div class="col-6 col-md-4 col-lg-3 col-xl-2">
+  <a class="model-card" href="{{ url_for('model', slug=m['actor_slug']) }}">
+    <div class="avatar-wrap">
+      <img loading="lazy" src="{{ m|avatar }}" alt="{{ m['name'] }}">
+      {% if m['scraped_album_count'] %}<span class="badge-count">{{ m['scraped_album_count'] }}</span>{% endif %}
+    </div>
+    <div class="model-name" title="{{ m['name'] }}">{{ m['name'] or m['actor_slug'] }}</div>
+  </a>
+</div>
+{% endmacro %}
+
+{% macro pager(pg, endpoint, args={}) %}
+{% if pg.pages > 1 %}
+<nav class="d-flex justify-content-center my-4">
+  <ul class="pagination v2-pager">
+    <li class="page-item {{ 'disabled' if not pg.has_prev }}">
+      <a class="page-link" href="{{ url_for(endpoint, page=pg.page-1, **args) }}">«</a>
+    </li>
+    {% set start = [1, pg.page-2]|max %}
+    {% set end = [pg.pages, pg.page+2]|min %}
+    {% if start > 1 %}
+      <li class="page-item"><a class="page-link" href="{{ url_for(endpoint, page=1, **args) }}">1</a></li>
+      {% if start > 2 %}<li class="page-item disabled"><span class="page-link">…</span></li>{% endif %}
+    {% endif %}
+    {% for p in range(start, end+1) %}
+      <li class="page-item {{ 'active' if p == pg.page }}">
+        <a class="page-link" href="{{ url_for(endpoint, page=p, **args) }}">{{ p }}</a>
+      </li>
+    {% endfor %}
+    {% if end < pg.pages %}
+      {% if end < pg.pages-1 %}<li class="page-item disabled"><span class="page-link">…</span></li>{% endif %}
+      <li class="page-item"><a class="page-link" href="{{ url_for(endpoint, page=pg.pages, **args) }}">{{ pg.pages }}</a></li>
+    {% endif %}
+    <li class="page-item {{ 'disabled' if not pg.has_next }}">
+      <a class="page-link" href="{{ url_for(endpoint, page=pg.page+1, **args) }}">»</a>
+    </li>
+  </ul>
+</nav>
+{% endif %}
+{% endmacro %}
+
+{% macro section_head(title, icon='') %}
+<div class="section-head">
+  <h2>{% if icon %}<i class="bi {{ icon }}"></i> {% endif %}{{ title }}</h2>
+  <span class="head-line"></span>
+</div>
+{% endmacro %}

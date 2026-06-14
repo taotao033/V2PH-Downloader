@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% from "_macros.html" import album_card, model_card, pager, section_head %}
+{% block title %}{{ t('search.title') }} {{ q }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+<h1 class="search-title">{{ t('search.title') }}：<span>{{ q }}</span></h1>
+
+{% if not q %}
+<div class="empty-state"><i class="bi bi-search"></i><p>{{ t('search.prompt') }}</p></div>
+{% else %}
+  {% if actors %}
+  {{ section_head(t('search.models'), 'bi-people') }}
+  <div class="row g-3">{% for m in actors %}{{ model_card(m) }}{% endfor %}</div>
+  {% endif %}
+
+  {{ section_head(t('search.albums') ~ ' (' ~ pg.total|string ~ ')', 'bi-collection') }}
+  {% if albums %}
+  <div class="row g-3">{% for a in albums %}{{ album_card(a) }}{% endfor %}</div>
+  {{ pager(pg, 'search', {'q': q}) }}
+  {% else %}
+  <div class="empty-state"><i class="bi bi-emoji-frown"></i><p>{{ t('search.empty') }}</p></div>
+  {% endif %}
+{% endif %}
+{% endblock %}
