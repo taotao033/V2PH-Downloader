@@ -24,7 +24,7 @@ def _random_password(length: int = 12) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Reset a V2PH webapp user's password locally.")
+    parser = argparse.ArgumentParser(description="Reset a HerHub webapp user's password locally.")
     parser.add_argument("login", nargs="?", help="username or email")
     parser.add_argument("--password", "-p", help="new password (>= 6 chars); random if omitted")
     parser.add_argument("--list", action="store_true", help="list all users and exit")

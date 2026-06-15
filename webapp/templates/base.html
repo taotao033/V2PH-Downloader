@@ -13,7 +13,7 @@
 <nav class="navbar navbar-expand-lg site-nav sticky-top">
   <div class="container">
     <a class="navbar-brand" href="{{ url_for('index') }}">
-      <span class="brand-mark">V2</span><span class="brand-rest">PH</span>
+      <i class="bi bi-images brand-icon"></i><span class="brand-text">Her</span><span class="brand-accent">Hub</span>
     </a>
     <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#mainNav">
       <span class="navbar-toggler-icon"></span>
@@ -116,7 +116,8 @@
       {% endfor %}
     </div>
     <p class="mb-1">{{ SITE_NAME }} · {{ SITE_TAGLINE }}</p>
-    <p class="text-muted small mb-0">{{ t('footer.note') }}</p>
+    <p class="text-muted small mb-2">{{ t('footer.note') }}</p>
+    <p class="footer-disclaimer text-muted mb-0">{{ t('footer.disclaimer') }}</p>
   </div>
 </footer>
 

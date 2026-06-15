@@ -4,14 +4,25 @@
 {% block content %}
 <section class="hero">
   <div class="hero-inner">
+    <span class="hero-badge"><i class="bi bi-patch-check-fill"></i> {{ t('home.hero_badge') }}</span>
     <h1>{{ t('home.hero_title') }}</h1>
-    <p class="hero-stats">
-      {{ t('home.stats').format(
-           albums=stats.albums|groupthousands,
-           models=stats.models|groupthousands,
-           photos=stats.photos|groupthousands,
-           vendors=stats.vendors|groupthousands) }}
-    </p>
+    <p class="hero-sub">{{ t('home.hero_sub') }}</p>
+    <div class="hero-cta">
+      <a class="btn btn-hero-primary" href="{{ url_for('models') }}"><i class="bi bi-images"></i> {{ t('home.cta_explore') }}</a>
+      {% if not current_user %}
+        <a class="btn btn-hero-ghost" href="{{ url_for('register') }}"><i class="bi bi-person-plus"></i> {{ t('home.cta_join') }}</a>
+      {% elif not is_vip %}
+        <a class="btn btn-hero-ghost" href="{{ url_for('pricing') }}"><i class="bi bi-gem"></i> {{ t('home.cta_vip') }}</a>
+      {% else %}
+        <a class="btn btn-hero-ghost" href="{{ url_for('random_album') }}"><i class="bi bi-shuffle"></i> {{ t('nav.random') }}</a>
+      {% endif %}
+    </div>
+    <div class="hero-stats-grid">
+      <div class="hstat"><b>{{ stats.albums|groupthousands }}</b><span>{{ t('home.stat_albums') }}</span></div>
+      <div class="hstat"><b>{{ stats.models|groupthousands }}</b><span>{{ t('home.stat_models') }}</span></div>
+      <div class="hstat"><b>{{ stats.photos|groupthousands }}</b><span>{{ t('home.stat_photos') }}</span></div>
+      <div class="hstat"><b>{{ stats.vendors|groupthousands }}</b><span>{{ t('home.stat_vendors') }}</span></div>
+    </div>
   </div>
 </section>
 

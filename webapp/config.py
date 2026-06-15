@@ -1,4 +1,4 @@
-"""Runtime configuration for the v2ph clone web app.
+"""Runtime configuration for the HerHub web app (HD photo-album hub).
 
 All paths can be overridden via environment variables so the app is portable
 between machines / archive locations:
@@ -20,8 +20,8 @@ COVER_DIR = os.environ.get("V2PH_COVERS", os.path.join(ARCHIVE_ROOT, "_covers"))
 HOST = os.environ.get("V2PH_HOST", "127.0.0.1")
 PORT = int(os.environ.get("V2PH_PORT", "8000"))
 
-SITE_NAME = os.environ.get("V2PH_SITE_NAME", "V2PH")
-SITE_TAGLINE = "高清写真图片站"
+SITE_NAME = os.environ.get("V2PH_SITE_NAME", "HerHub")
+SITE_TAGLINE = os.environ.get("V2PH_SITE_TAGLINE", "高清写真图集资源站")
 
 PAGE_SIZE = 24          # album cards per listing page
 PHOTOS_PER_PAGE = 40    # photos per page on an album viewer
