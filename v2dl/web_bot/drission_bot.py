@@ -533,6 +533,13 @@ return (async () => {
                 self.handle_login()
                 self.handle_read_limit()
                 self.handle_image_captcha()
+                if self._is_image_captcha_page():
+                    self.logger.warning(
+                        "Captcha still blocking %s after solve handler - "
+                        "retrying page load",
+                        url,
+                    )
+                    continue
                 self.page.run_js("document.body.style.zoom='50%'")
                 await self.scroller.scroll_to_bottom()
 
@@ -721,6 +728,17 @@ return (function () {
 })();
 """
 
+    _ALBUM_PHOTO_DETECT_JS = """
+return (function () {
+    try {
+        return !!document.querySelector(
+            'div.album-photo img[src^="http"], '
+            + 'div.album-photo-small img[src^="http"]'
+        );
+    } catch (e) { return false; }
+})();
+"""
+
     def _is_image_captcha_page(self) -> bool:
         """Return True when the current page is v2ph's image-captcha
         interception, regardless of whether it uses the legacy
@@ -733,17 +751,43 @@ return (function () {
             return False
         return bool(result)
 
+    def _has_album_photo_content(self) -> bool:
+        """Return True when album thumbnail ``<img src="https://...">`` nodes
+        are present - the positive signal that a captcha gate has cleared.
+        """
+        try:
+            result = self.page.run_js(self._ALBUM_PHOTO_DETECT_JS)
+        except Exception:
+            return False
+        return bool(result)
+
+    def _is_captcha_solved(self) -> bool:
+        """Return True only when the captcha UI is gone *and* album photos
+        are visible. A bare ``not _is_image_captcha_page()`` is unreliable
+        during ``page.refresh()`` while the DOM is still loading.
+        """
+        if self._is_image_captcha_page():
+            return False
+        return self._has_album_photo_content()
+
     # Number of automated solve attempts before falling back to the
     # manual-input wait loop. ddddocr clears v2ph's 4-character colour
     # noise captcha at ~85-90% per attempt on a single shot, and v2ph
     # rolls a fresh captcha after every failed POST, so 5 attempts
     # gives well over 99% cumulative success when ddddocr is installed.
-    _CAPTCHA_AUTO_ATTEMPTS = 5
+    _CAPTCHA_AUTO_ATTEMPTS = 50
 
     # Per-attempt deadline for the page to navigate away from the
     # captcha after we click Submit. v2ph normally responds in <1 s
     # but slow networks / VPNs can push it past 3 s.
     _CAPTCHA_SUBMIT_WAIT = 6.0
+    # How long to wait for a fresh inline captcha after page.reload().
+    _CAPTCHA_REFRESH_WAIT = 5.0
+    # Consecutive page reloads rolled before each OCR read. v2ph serves
+    # the captcha inline on first paint; a few reloads avoids OCR on a
+    # stale or glitchy first frame (especially after the click-to-
+    # refresh handler stopped working).
+    _CAPTCHA_PRE_OCR_REFRESH_COUNT = 3
 
     def _get_ocr(self) -> Any:
         """Return a lazily-initialised ``ddddocr.DdddOcr`` instance, or
@@ -793,18 +837,59 @@ return (function () {
             return None
 
     def _refresh_captcha_image(self) -> None:
-        """Click the captcha image to trigger v2ph's built-in
-        ``location.reload()`` handler so the next attempt sees a
-        fresh challenge. Used when OCR returns garbage and we don't
-        want to waste a Submit round-trip on it.
+        """Reload the page to fetch a fresh captcha challenge.
+
+        v2ph still ships an inline ``$('#captcha-image').on('click',
+        location.reload)`` snippet, but the new layout only loads
+        vanilla ``app.js`` (no jQuery), so that handler never binds
+        and clicking the image does nothing. A full page reload matches
+        what users do with F5 / the browser refresh button.
         """
         try:
-            self.page.run_js(
+            old_src = self.page.run_js(
                 "var el = document.getElementById('captcha-image'); "
-                "if (el) el.click();"
+                "return el ? el.src : '';"
             )
+        except Exception:
+            old_src = ""
+
+        try:
+            self.page.refresh()
         except Exception as e:
             self.logger.debug("captcha image refresh failed: %s", e)
+            return
+
+        deadline = time.time() + self._CAPTCHA_REFRESH_WAIT
+        while time.time() < deadline:
+            time.sleep(0.3)
+            try:
+                if self._is_captcha_solved():
+                    return
+                if not self._is_image_captcha_page():
+                    # Mid-reload blank DOM — keep polling until captcha or
+                    # album content reappears.
+                    continue
+                new_src = self.page.run_js(
+                    "var el = document.getElementById('captcha-image'); "
+                    "return el ? el.src : '';"
+                )
+                if isinstance(new_src, str) and new_src and new_src != old_src:
+                    return
+            except Exception:
+                continue
+
+    def _refresh_captcha_before_ocr(self, attempt: int) -> None:
+        """Reload the captcha page several times before OCR."""
+        count = self._CAPTCHA_PRE_OCR_REFRESH_COUNT
+        if count <= 0:
+            return
+        self.logger.info(
+            "Captcha auto-solve attempt %d/%d: refreshing %d time(s) "
+            "before OCR",
+            attempt, self._CAPTCHA_AUTO_ATTEMPTS, count,
+        )
+        for _ in range(count):
+            self._refresh_captcha_image()
 
     def _try_auto_solve_captcha_once(self, attempt: int) -> bool:
         """Run a single OCR-and-submit cycle. Returns True iff the
@@ -818,6 +903,8 @@ return (function () {
         ocr = self._get_ocr()
         if ocr is None:
             return False
+
+        self._refresh_captcha_before_ocr(attempt)
 
         img_bytes = self._read_captcha_image_bytes()
         if not img_bytes:
@@ -848,7 +935,6 @@ return (function () {
                 attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
             )
             self._refresh_captcha_image()
-            DriBehavior.random_sleep(0.5, 1.0)
             return False
 
         self.logger.info(
@@ -880,10 +966,10 @@ return (function () {
         while time.time() < deadline:
             time.sleep(0.4)
             try:
-                if not self._is_image_captcha_page():
+                if self._is_captcha_solved():
                     return True
             except Exception:
-                return True
+                pass
         return False
 
     def handle_image_captcha(self) -> bool:
@@ -900,8 +986,11 @@ return (function () {
            see a fresh challenge.
         2. If ddddocr isn't installed, or every auto-solve attempt
            failed, fall back to the manual-input wait loop: log a
-           warning and poll the JS detector until the user solves the
-           captcha by hand in the open Chromium window.
+           warning and poll until the user solves the captcha by hand
+           in the open Chromium window. The scraper does **not**
+           advance to the next page/album until
+           :py:meth:`_is_captcha_solved` reports album thumbnails on
+           screen.
 
         The captcha currently ships in two flavours:
 
@@ -938,44 +1027,49 @@ return (function () {
                         "Captcha auto-solve attempt %d errored: %s",
                         attempt, e,
                     )
-                # Confirm we're still on the captcha page before
-                # spending another attempt. If the user solved it
-                # manually mid-loop, exit early.
                 try:
-                    if not self._is_image_captcha_page():
+                    if self._is_captcha_solved():
                         self.logger.info(
-                            "Captcha cleared (likely solved manually) - "
-                            "continuing process"
+                            "Captcha cleared on attempt %d - "
+                            "continuing process",
+                            attempt,
                         )
                         return True
-                except Exception:
-                    return True
+                except Exception as e:
+                    self.logger.debug(
+                        "Captcha solve check failed on attempt %d: %s",
+                        attempt, e,
+                    )
+                if attempt < self._CAPTCHA_AUTO_ATTEMPTS:
+                    self.logger.info(
+                        "Captcha auto-solve attempt %d/%d did not clear "
+                        "the gate - retrying",
+                        attempt, self._CAPTCHA_AUTO_ATTEMPTS,
+                    )
 
             self.logger.warning(
                 "Captcha auto-solve gave up after %d attempts - please "
-                "solve the captcha in the opened browser. The download "
-                "will resume automatically once verified.",
+                "solve the captcha in the opened browser (use F5 to "
+                "refresh the image if needed). The download will resume "
+                "automatically once verified.",
                 self._CAPTCHA_AUTO_ATTEMPTS,
             )
         else:
             self.logger.warning(
                 "Image captcha detected - please solve the captcha in "
-                "the opened browser. (Install `ddddocr` for automatic "
-                "solving: `pip install v2dl[ocr]`.) The download will "
-                "resume automatically once verified."
+                "the opened browser (use F5 to refresh the image if "
+                "needed). (Install `ddddocr` for automatic solving: "
+                "`pip install v2dl[ocr]`.) The download will resume "
+                "automatically once verified."
             )
 
         while True:
             try:
-                if not self._is_image_captcha_page():
+                if self._is_captcha_solved():
                     self.logger.info("Captcha completed - continuing process")
                     return True
-            except Exception:
-                # Page likely navigated mid-check (form submit raced
-                # with our JS read). Treat as solved and let the outer
-                # loop re-check.
-                self.logger.info("Captcha completed - continuing process")
-                return True
+            except Exception as e:
+                self.logger.debug("Captcha solve check failed while waiting: %s", e)
             DriBehavior.random_sleep(1.0, 2.0)
 
     def cookies_login(self) -> bool:

@@ -360,6 +360,13 @@ const done = arguments[arguments.length - 1];
                 self.handle_login()
                 self.handle_read_limit()
                 self.handle_image_captcha()
+                if self._is_image_captcha_page():
+                    self.logger.warning(
+                        "Captcha still blocking %s after solve handler - "
+                        "retrying page load",
+                        url,
+                    )
+                    continue
                 self.driver.execute_script("document.body.style.zoom='50%'")
                 await self.scroller.scroll_to_bottom()
                 SelBehavior.random_sleep(5, 15)
@@ -524,6 +531,17 @@ return (function () {
 })();
 """
 
+    _ALBUM_PHOTO_DETECT_JS = """
+return (function () {
+    try {
+        return !!document.querySelector(
+            'div.album-photo img[src^="http"], '
+            + 'div.album-photo-small img[src^="http"]'
+        );
+    } catch (e) { return false; }
+})();
+"""
+
     def _is_image_captcha_page(self) -> bool:
         """Return True when the current page is v2ph's image-captcha
         interception, regardless of which layout is served.
@@ -534,9 +552,25 @@ return (function () {
             return False
         return bool(result)
 
+    def _has_album_photo_content(self) -> bool:
+        """Return True when album thumbnail images are on screen."""
+        try:
+            result = self.driver.execute_script(self._ALBUM_PHOTO_DETECT_JS)
+        except Exception:
+            return False
+        return bool(result)
+
+    def _is_captcha_solved(self) -> bool:
+        """Return True only when captcha UI is gone and album photos show."""
+        if self._is_image_captcha_page():
+            return False
+        return self._has_album_photo_content()
+
     # See ``DrissionBot._CAPTCHA_AUTO_ATTEMPTS`` for rationale.
-    _CAPTCHA_AUTO_ATTEMPTS = 5
+    _CAPTCHA_AUTO_ATTEMPTS = 50
     _CAPTCHA_SUBMIT_WAIT = 6.0
+    _CAPTCHA_REFRESH_WAIT = 5.0
+    _CAPTCHA_PRE_OCR_REFRESH_COUNT = 3
 
     def _get_ocr(self) -> Any:
         """Return a lazily-initialised ``ddddocr.DdddOcr`` instance, or
@@ -583,16 +617,54 @@ return (function () {
             return None
 
     def _refresh_captcha_image(self) -> None:
-        """Click the captcha image so v2ph's ``location.reload()``
-        handler fetches a fresh challenge.
+        """Reload the page to fetch a fresh captcha challenge.
+
+        See :py:meth:`DrissionBot._refresh_captcha_image` for why we
+        no longer simulate a click on ``#captcha-image``.
         """
         try:
-            self.driver.execute_script(
+            old_src = self.driver.execute_script(
                 "var el = document.getElementById('captcha-image'); "
-                "if (el) el.click();"
+                "return el ? el.src : '';"
             )
+        except Exception:
+            old_src = ""
+
+        try:
+            self.driver.refresh()
         except Exception as e:
             self.logger.debug("captcha image refresh failed: %s", e)
+            return
+
+        deadline = time.time() + self._CAPTCHA_REFRESH_WAIT
+        while time.time() < deadline:
+            time.sleep(0.3)
+            try:
+                if self._is_captcha_solved():
+                    return
+                if not self._is_image_captcha_page():
+                    continue
+                new_src = self.driver.execute_script(
+                    "var el = document.getElementById('captcha-image'); "
+                    "return el ? el.src : '';"
+                )
+                if isinstance(new_src, str) and new_src and new_src != old_src:
+                    return
+            except Exception:
+                continue
+
+    def _refresh_captcha_before_ocr(self, attempt: int) -> None:
+        """Reload the captcha page several times before OCR."""
+        count = self._CAPTCHA_PRE_OCR_REFRESH_COUNT
+        if count <= 0:
+            return
+        self.logger.info(
+            "Captcha auto-solve attempt %d/%d: refreshing %d time(s) "
+            "before OCR",
+            attempt, self._CAPTCHA_AUTO_ATTEMPTS, count,
+        )
+        for _ in range(count):
+            self._refresh_captcha_image()
 
     def _try_auto_solve_captcha_once(self, attempt: int) -> bool:
         """Run a single OCR-and-submit cycle. Returns True iff the
@@ -601,6 +673,8 @@ return (function () {
         ocr = self._get_ocr()
         if ocr is None:
             return False
+
+        self._refresh_captcha_before_ocr(attempt)
 
         img_bytes = self._read_captcha_image_bytes()
         if not img_bytes:
@@ -629,7 +703,6 @@ return (function () {
                 attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
             )
             self._refresh_captcha_image()
-            time.sleep(random.uniform(0.5, 1.0))
             return False
 
         self.logger.info(
@@ -657,10 +730,10 @@ return (function () {
         while time.time() < deadline:
             time.sleep(0.4)
             try:
-                if not self._is_image_captcha_page():
+                if self._is_captcha_solved():
                     return True
             except Exception:
-                return True
+                pass
         return False
 
     def handle_image_captcha(self) -> bool:
@@ -699,37 +772,48 @@ return (function () {
                         attempt, e,
                     )
                 try:
-                    if not self._is_image_captcha_page():
+                    if self._is_captcha_solved():
                         self.logger.info(
-                            "Captcha cleared (likely solved manually) - "
-                            "continuing process"
+                            "Captcha cleared on attempt %d - "
+                            "continuing process",
+                            attempt,
                         )
                         return True
-                except Exception:
-                    return True
+                except Exception as e:
+                    self.logger.debug(
+                        "Captcha solve check failed on attempt %d: %s",
+                        attempt, e,
+                    )
+                if attempt < self._CAPTCHA_AUTO_ATTEMPTS:
+                    self.logger.info(
+                        "Captcha auto-solve attempt %d/%d did not clear "
+                        "the gate - retrying",
+                        attempt, self._CAPTCHA_AUTO_ATTEMPTS,
+                    )
 
             self.logger.warning(
                 "Captcha auto-solve gave up after %d attempts - please "
-                "solve the captcha in the opened browser. The download "
-                "will resume automatically once verified.",
+                "solve the captcha in the opened browser (use F5 to "
+                "refresh the image if needed). The download will resume "
+                "automatically once verified.",
                 self._CAPTCHA_AUTO_ATTEMPTS,
             )
         else:
             self.logger.warning(
                 "Image captcha detected - please solve the captcha in "
-                "the opened browser. (Install `ddddocr` for automatic "
-                "solving: `pip install v2dl[ocr]`.) The download will "
-                "resume automatically once verified."
+                "the opened browser (use F5 to refresh the image if "
+                "needed). (Install `ddddocr` for automatic solving: "
+                "`pip install v2dl[ocr]`.) The download will resume "
+                "automatically once verified."
             )
 
         while True:
             try:
-                if not self._is_image_captcha_page():
+                if self._is_captcha_solved():
                     self.logger.info("Captcha completed - continuing process")
                     return True
-            except Exception:
-                self.logger.info("Captcha completed - continuing process")
-                return True
+            except Exception as e:
+                self.logger.debug("Captcha solve check failed while waiting: %s", e)
             time.sleep(random.uniform(1.0, 2.0))
 
     def cookies_login(self) -> bool:
