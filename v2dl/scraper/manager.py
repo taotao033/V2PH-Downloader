@@ -434,7 +434,8 @@ class ScrapeManager:
             return False
         listed = self._listed_photo_count_for_album(clean_url)
         if listed is not None and listed > 0:
-            return on_disk >= listed
+            diff = abs(listed - on_disk) # Allow a small discrepancy (e.g. 1-2 images) due to site-side changes or VIP-blocked images.
+            return on_disk >= listed or diff <= 2
         return True
 
     def _actor_album_should_skip(
