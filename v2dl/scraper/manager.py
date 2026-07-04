@@ -1152,6 +1152,10 @@ class PageScraper(Generic[PageResultType]):
             # ``ensure_cdn_warmed`` is idempotent across the session.
             if scrape_type == "album_image" and page_links:
                 try:
+                    # A transient tab-death / CF failure on page N must
+                    # not block warmup retries on page N+1.
+                    if hasattr(self.web_bot, "_cdn_warmed_failed"):
+                        self.web_bot._cdn_warmed_failed = False
                     self.web_bot.ensure_cdn_warmed(page_links[0])
                 except Exception as e:
                     self.logger.debug("CDN warmup raised: %s", e)

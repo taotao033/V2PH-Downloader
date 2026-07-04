@@ -298,7 +298,25 @@ class DrissionBot(BaseBot):
             cookies = {k: v for k, (_, v) in staged.items()}
         return cookies
 
-    def ensure_cdn_warmed(self, url: str) -> bool:
+    # DrissionPage defaults ``timeouts.script`` to 30 s, which is too
+    # tight for large CDN images once JS has fetched the body and is
+    # base64-encoding it back to Python.
+    _CDN_FETCH_JS_TIMEOUT = 120.0
+    _CDN_WARMUP_TIMEOUT = 25.0
+
+    def _cdn_tab_is_alive(self) -> bool:
+        """Return True when the parked CDN tab still answers a trivial JS call."""
+        if self._cdn_tab is None:
+            return False
+        try:
+            self._cdn_tab.run_js("return 1", timeout=5)
+            return True
+        except Exception:
+            return False
+
+    def ensure_cdn_warmed(
+        self, url: str, *, permanent_failure: bool = True
+    ) -> bool:
         """Open ``url`` in a background tab and wait for Cloudflare to
         clear. The tab is **kept open** afterwards so ``browser_fetch``
         can run ``fetch()`` inside it (same-origin to cdn.v2ph.com).
@@ -310,11 +328,20 @@ class DrissionBot(BaseBot):
         itself cannot pass CF for cdn.v2ph.com, so no client-side
         workaround will help and we log a loud warning.
 
-        Idempotent across a session.
+        Idempotent across a session. When ``permanent_failure`` is
+        False (re-warm path) a failed attempt does not latch the
+        session-wide ``_cdn_warmed_failed`` flag so later pages can
+        retry.
         """
-        if self._cdn_tab is not None:
+        if self._cdn_tab_is_alive():
             return True
-        if getattr(self, "_cdn_warmed_failed", False):
+        if self._cdn_tab is not None:
+            try:
+                self._cdn_tab.close()
+            except Exception:
+                pass
+            self._cdn_tab = None
+        if permanent_failure and getattr(self, "_cdn_warmed_failed", False):
             return False
         if not url:
             return False
@@ -322,7 +349,7 @@ class DrissionBot(BaseBot):
         new_tab = None
         keep_tab = False
         last_ct = ""
-        warmup_timeout = 25.0
+        warmup_timeout = self._CDN_WARMUP_TIMEOUT
         try:
             new_tab = self.page.new_tab(url)
             deadline = time.time() + warmup_timeout
@@ -355,7 +382,8 @@ class DrissionBot(BaseBot):
                 last_ct,
                 url,
             )
-            self._cdn_warmed_failed = True
+            if permanent_failure:
+                self._cdn_warmed_failed = True
             return False
         except Exception as e:
             self.logger.warning("CDN warmup failed for %s: %s", url, e)
@@ -413,8 +441,11 @@ return (async () => {
         if self._cdn_tab is None:
             return None
 
+        js_timeout = self._CDN_FETCH_JS_TIMEOUT
         try:
-            return self._cdn_tab.run_js(self._CDN_FETCH_JS, url)
+            return self._cdn_tab.run_js(
+                self._CDN_FETCH_JS, url, timeout=js_timeout
+            )
         except Exception as e:
             # First time we see this we want a *visible* signal; the
             # caller in ``core.py`` only logs a generic "no result"
@@ -424,10 +455,12 @@ return (async () => {
             if not self._cdn_runjs_warning_logged:
                 self.logger.warning(
                     "CDN tab run_js raised: %s. The parked "
-                    "cdn.v2ph.com tab appears to have been discarded "
-                    "by Chromium; attempting to re-warm it before "
-                    "retrying the fetch.",
+                    "cdn.v2ph.com tab may have been discarded by "
+                    "Chromium or the in-page fetch timed out after "
+                    "%.0fs; attempting to re-warm it before retrying "
+                    "the fetch.",
                     e,
+                    js_timeout,
                 )
                 self._cdn_runjs_warning_logged = True
             else:
@@ -450,14 +483,19 @@ return (async () => {
         # failed" state from a previous session.
         self._cdn_warmed_failed = False
 
-        if not self.ensure_cdn_warmed(rewarm_url) or self._cdn_tab is None:
+        if (
+            not self.ensure_cdn_warmed(rewarm_url, permanent_failure=False)
+            or self._cdn_tab is None
+        ):
             return None
 
         # New tab acquired; reset the one-shot warning so a *future*
         # death (e.g. cf_bm rotation hours later) is also surfaced.
         self._cdn_runjs_warning_logged = False
         try:
-            return self._cdn_tab.run_js(self._CDN_FETCH_JS, url)
+            return self._cdn_tab.run_js(
+                self._CDN_FETCH_JS, url, timeout=js_timeout
+            )
         except Exception as e:
             self.logger.warning(
                 "CDN tab run_js still failing after re-warm for %s: %s",
@@ -775,19 +813,19 @@ return (function () {
     # noise captcha at ~85-90% per attempt on a single shot, and v2ph
     # rolls a fresh captcha after every failed POST, so 5 attempts
     # gives well over 99% cumulative success when ddddocr is installed.
-    _CAPTCHA_AUTO_ATTEMPTS = 50
+    _CAPTCHA_AUTO_ATTEMPTS = 100
 
     # Per-attempt deadline for the page to navigate away from the
     # captcha after we click Submit. v2ph normally responds in <1 s
     # but slow networks / VPNs can push it past 3 s.
-    _CAPTCHA_SUBMIT_WAIT = 6.0
+    _CAPTCHA_SUBMIT_WAIT = 10.0
     # How long to wait for a fresh inline captcha after page.reload().
-    _CAPTCHA_REFRESH_WAIT = 5.0
+    _CAPTCHA_REFRESH_WAIT = 8.0
     # Consecutive page reloads rolled before each OCR read. v2ph serves
     # the captcha inline on first paint; a few reloads avoids OCR on a
     # stale or glitchy first frame (especially after the click-to-
     # refresh handler stopped working).
-    _CAPTCHA_PRE_OCR_REFRESH_COUNT = 3
+    _CAPTCHA_PRE_OCR_REFRESH_COUNT = 2
 
     def _get_ocr(self) -> Any:
         """Return a lazily-initialised ``ddddocr.DdddOcr`` instance, or

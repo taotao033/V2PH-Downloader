@@ -72,6 +72,8 @@ class SeleniumBot(BaseBot):
         # via fetch() so that the request is first-party / same-origin
         # to the CDN.
         self._cdn_window_handle: str | None = None
+        self._cdn_warmup_url: str | None = None
+        self._cdn_runjs_warning_logged: bool = False
         # Lazily-initialised ddddocr instance and an init-failure latch.
         # We don't load the ONNX model until the first captcha actually
         # fires (~200 ms warm-up + a few MB of RAM).
@@ -161,15 +163,49 @@ class SeleniumBot(BaseBot):
                     staged[key] = (str(domain), str(value))
         return {k: v for k, (_, v) in staged.items()}
 
-    def ensure_cdn_warmed(self, url: str) -> bool:
+    _CDN_FETCH_JS_TIMEOUT = 120.0
+    _CDN_WARMUP_TIMEOUT = 25.0
+
+    def _cdn_window_is_alive(self) -> bool:
+        if self._cdn_window_handle is None:
+            return False
+        if self._cdn_window_handle not in self.driver.window_handles:
+            return False
+        original_handle: str | None = None
+        try:
+            original_handle = self.driver.current_window_handle
+            self.driver.switch_to.window(self._cdn_window_handle)
+            self.driver.set_script_timeout(5)
+            self.driver.execute_script("return 1")
+            return True
+        except Exception:
+            return False
+        finally:
+            if original_handle is not None:
+                try:
+                    self.driver.switch_to.window(original_handle)
+                except Exception:
+                    pass
+
+    def ensure_cdn_warmed(
+        self, url: str, *, permanent_failure: bool = True
+    ) -> bool:
         """Open ``url`` in a background window and wait for Cloudflare
         to clear. The window is **kept open** afterwards so
         ``browser_fetch`` can run ``fetch()`` from it (same-origin to
         cdn.v2ph.com).
         """
-        if self._cdn_window_handle is not None:
+        if self._cdn_window_is_alive():
             return True
-        if getattr(self, "_cdn_warmed_failed", False):
+        if self._cdn_window_handle is not None:
+            try:
+                if self._cdn_window_handle in self.driver.window_handles:
+                    self.driver.switch_to.window(self._cdn_window_handle)
+                    self.driver.close()
+            except Exception:
+                pass
+            self._cdn_window_handle = None
+        if permanent_failure and getattr(self, "_cdn_warmed_failed", False):
             return False
         if not url:
             return False
@@ -178,7 +214,7 @@ class SeleniumBot(BaseBot):
         new_handle: str | None = None
         keep_window = False
         last_ct = ""
-        warmup_timeout = 25.0
+        warmup_timeout = self._CDN_WARMUP_TIMEOUT
         try:
             original_handle = self.driver.current_window_handle
             existing = set(self.driver.window_handles)
@@ -206,6 +242,7 @@ class SeleniumBot(BaseBot):
                 if last_ct.lower().startswith("image/"):
                     time.sleep(0.3)
                     self._cdn_window_handle = new_handle
+                    self._cdn_warmup_url = url
                     keep_window = True
                     self.logger.info(
                         "CDN warmup ok (contentType=%s); keeping the "
@@ -224,7 +261,8 @@ class SeleniumBot(BaseBot):
                 last_ct,
                 url,
             )
-            self._cdn_warmed_failed = True
+            if permanent_failure:
+                self._cdn_warmed_failed = True
             return False
         except Exception as e:
             self.logger.warning("CDN warmup failed for %s: %s", url, e)
@@ -273,6 +311,85 @@ const done = arguments[arguments.length - 1];
 })();
 """
 
+    def _run_cdn_fetch_js(self, url: str) -> Any:
+        """Run :pyattr:`_CDN_FETCH_JS` in the parked CDN window, re-warming
+        once if the window was closed or the script timed out."""
+        if self._cdn_window_handle is None:
+            return None
+
+        js_timeout = int(self._CDN_FETCH_JS_TIMEOUT)
+        original_handle: str | None = None
+
+        def _execute() -> Any:
+            nonlocal original_handle
+            try:
+                original_handle = self.driver.current_window_handle
+            except Exception:
+                original_handle = None
+            self.driver.switch_to.window(self._cdn_window_handle)
+            self.driver.set_script_timeout(js_timeout)
+            return self.driver.execute_async_script(self._CDN_FETCH_JS, url)
+
+        try:
+            return _execute()
+        except Exception as e:
+            if not self._cdn_runjs_warning_logged:
+                self.logger.warning(
+                    "CDN window script raised: %s. The parked "
+                    "cdn.v2ph.com window may have been closed or the "
+                    "in-page fetch timed out after %ds; attempting to "
+                    "re-warm it before retrying the fetch.",
+                    e,
+                    js_timeout,
+                )
+                self._cdn_runjs_warning_logged = True
+            else:
+                self.logger.debug(
+                    "CDN window script raised for %s: %s", url, e
+                )
+        finally:
+            if original_handle is not None:
+                try:
+                    self.driver.switch_to.window(original_handle)
+                except Exception:
+                    pass
+
+        rewarm_url = self._cdn_warmup_url or url
+        try:
+            if (
+                self._cdn_window_handle is not None
+                and self._cdn_window_handle in self.driver.window_handles
+            ):
+                self.driver.switch_to.window(self._cdn_window_handle)
+                self.driver.close()
+        except Exception:
+            pass
+        self._cdn_window_handle = None
+        self._cdn_warmed_failed = False
+
+        if (
+            not self.ensure_cdn_warmed(rewarm_url, permanent_failure=False)
+            or self._cdn_window_handle is None
+        ):
+            return None
+
+        self._cdn_runjs_warning_logged = False
+        try:
+            return _execute()
+        except Exception as e:
+            self.logger.warning(
+                "CDN window script still failing after re-warm for %s: %s",
+                url,
+                e,
+            )
+            return None
+        finally:
+            if original_handle is not None:
+                try:
+                    self.driver.switch_to.window(original_handle)
+                except Exception:
+                    pass
+
     def browser_fetch(self, url: str) -> tuple[int, bytes] | None:
         """Fetch ``url`` via ``fetch()`` inside the parked cdn.v2ph.com
         window. Same-origin request, so Cloudflare cannot tell our fetch
@@ -284,36 +401,7 @@ const done = arguments[arguments.length - 1];
         if self._cdn_window_handle is None:
             return None
 
-        original_handle: str | None = None
-        try:
-            try:
-                original_handle = self.driver.current_window_handle
-            except Exception:
-                original_handle = None
-            try:
-                self.driver.switch_to.window(self._cdn_window_handle)
-            except Exception as e:
-                self.logger.debug(
-                    "Lost CDN window handle (%s); will give up on browser_fetch",
-                    e,
-                )
-                self._cdn_window_handle = None
-                return None
-
-            # ``execute_async_script`` requires a script timeout; size it
-            # generously since CDN response + base64 encode can take a
-            # few seconds for big images.
-            self.driver.set_script_timeout(60)
-            result = self.driver.execute_async_script(self._CDN_FETCH_JS, url)
-        except Exception as e:
-            self.logger.debug("browser_fetch failed for %s: %s", url, e)
-            return None
-        finally:
-            if original_handle is not None:
-                try:
-                    self.driver.switch_to.window(original_handle)
-                except Exception:
-                    pass
+        result = self._run_cdn_fetch_js(url)
 
         if not isinstance(result, dict):
             return None
@@ -567,10 +655,10 @@ return (function () {
         return self._has_album_photo_content()
 
     # See ``DrissionBot._CAPTCHA_AUTO_ATTEMPTS`` for rationale.
-    _CAPTCHA_AUTO_ATTEMPTS = 50
-    _CAPTCHA_SUBMIT_WAIT = 6.0
-    _CAPTCHA_REFRESH_WAIT = 5.0
-    _CAPTCHA_PRE_OCR_REFRESH_COUNT = 3
+    _CAPTCHA_AUTO_ATTEMPTS = 100
+    _CAPTCHA_SUBMIT_WAIT = 10.0
+    _CAPTCHA_REFRESH_WAIT = 8.0
+    _CAPTCHA_PRE_OCR_REFRESH_COUNT = 2
 
     def _get_ocr(self) -> Any:
         """Return a lazily-initialised ``ddddocr.DdddOcr`` instance, or
