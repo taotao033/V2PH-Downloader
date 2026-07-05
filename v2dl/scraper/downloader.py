@@ -61,8 +61,19 @@ class DownloadPathTool:
         file_path = Path(file_path)
         existing_files = cache.get_files(file_path.parent)
         if str(file_path) in existing_files:
-            logger.info("File already exists (ignoring extension): '%s'", file_path)
+            logger.info("File already exists: '%s'", file_path)
             return True
+        # ``download_file`` builds dest without an extension and appends
+        # the real suffix only after the response (e.g. 001 -> 001.jpg).
+        # Match any on-disk variant sharing the same stem to avoid rewrites.
+        stem = file_path.stem
+        for existing in existing_files:
+            if Path(existing).stem == stem:
+                logger.info(
+                    "File already exists (ignoring extension): '%s'",
+                    existing,
+                )
+                return True
         return False
 
     @staticmethod
