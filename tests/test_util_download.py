@@ -45,7 +45,7 @@ def test_is_file_exists(test_dir, mock_logger, filename, force_download, expecte
     # 验证 logger 是否被正确调用
     if expected and not force_download and filename == "testfile.txt":
         mock_logger.info.assert_called_once_with(
-            "File already exists (ignoring extension): '%s'", file_path
+            "File already exists: '%s'", file_path
         )
     else:
         mock_logger.info.assert_not_called()
@@ -63,6 +63,25 @@ def test_file_not_exists_no_force_download(test_dir, mock_logger, dir_cache):
     result = DownloadPathTool.is_file_exists(file_path, False, dir_cache, mock_logger)
 
     assert result is False
+
+
+def test_is_file_exists_matches_stem_without_extension(test_dir, mock_logger):
+    """Dest paths omit the suffix until after download; skip if stem is on disk."""
+    cache = DirectoryCache()
+    dest_without_ext = test_dir / "testfile2"
+
+    result = DownloadPathTool.is_file_exists(
+        file_path=dest_without_ext,
+        force_download=False,
+        cache=cache,
+        logger=mock_logger,
+    )
+
+    assert result is True
+    mock_logger.info.assert_called_once_with(
+        "File already exists (ignoring extension): '%s'",
+        str(test_dir / "testfile2.any"),
+    )
 
 
 # ============ test cache ============
