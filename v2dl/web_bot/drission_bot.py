@@ -813,19 +813,19 @@ return (function () {
     # noise captcha at ~85-90% per attempt on a single shot, and v2ph
     # rolls a fresh captcha after every failed POST, so 5 attempts
     # gives well over 99% cumulative success when ddddocr is installed.
-    _CAPTCHA_AUTO_ATTEMPTS = 100
+    _CAPTCHA_AUTO_ATTEMPTS = 150
 
     # Per-attempt deadline for the page to navigate away from the
     # captcha after we click Submit. v2ph normally responds in <1 s
     # but slow networks / VPNs can push it past 3 s.
-    _CAPTCHA_SUBMIT_WAIT = 10.0
+    _CAPTCHA_SUBMIT_WAIT = 6.0
     # How long to wait for a fresh inline captcha after page.reload().
-    _CAPTCHA_REFRESH_WAIT = 8.0
+    _CAPTCHA_REFRESH_WAIT = 60.0
     # Consecutive page reloads rolled before each OCR read. v2ph serves
     # the captcha inline on first paint; a few reloads avoids OCR on a
     # stale or glitchy first frame (especially after the click-to-
     # refresh handler stopped working).
-    _CAPTCHA_PRE_OCR_REFRESH_COUNT = 2
+    _CAPTCHA_PRE_OCR_REFRESH_COUNT = 1
 
     def _get_ocr(self) -> Any:
         """Return a lazily-initialised ``ddddocr.DdddOcr`` instance, or
@@ -955,6 +955,7 @@ return (function () {
             return False
 
         text = prediction.strip() if isinstance(prediction, str) else ""
+        self._cache_captcha_image(img_bytes, prediction=text or None)
         # v2ph's captcha is always 4 ASCII alphanumeric characters.
         # If OCR produces punctuation, whitespace or non-ASCII glyphs
         # (e.g. it picked up a noise line as a Chinese radical) it's
@@ -1044,6 +1045,11 @@ return (function () {
         if not self._is_image_captcha_page():
             self.logger.debug("No image captcha detected")
             return True
+
+        if not _HAS_DDDDOCR:
+            img_bytes = self._read_captcha_image_bytes()
+            if img_bytes:
+                self._cache_captcha_image(img_bytes)
 
         if _HAS_DDDDOCR:
             self.logger.info(

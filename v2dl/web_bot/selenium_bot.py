@@ -655,10 +655,10 @@ return (function () {
         return self._has_album_photo_content()
 
     # See ``DrissionBot._CAPTCHA_AUTO_ATTEMPTS`` for rationale.
-    _CAPTCHA_AUTO_ATTEMPTS = 100
-    _CAPTCHA_SUBMIT_WAIT = 10.0
-    _CAPTCHA_REFRESH_WAIT = 8.0
-    _CAPTCHA_PRE_OCR_REFRESH_COUNT = 2
+    _CAPTCHA_AUTO_ATTEMPTS = 150
+    _CAPTCHA_SUBMIT_WAIT = 6.0
+    _CAPTCHA_REFRESH_WAIT = 60.0
+    _CAPTCHA_PRE_OCR_REFRESH_COUNT = 1
 
     def _get_ocr(self) -> Any:
         """Return a lazily-initialised ``ddddocr.DdddOcr`` instance, or
@@ -775,6 +775,7 @@ return (function () {
             return False
 
         text = prediction.strip() if isinstance(prediction, str) else ""
+        self._cache_captcha_image(img_bytes, prediction=text or None)
         # v2ph's captcha is always 4 ASCII alphanumeric characters.
         # If OCR returns punctuation / whitespace / non-ASCII it's
         # garbage; refresh and skip the submit.
@@ -838,6 +839,11 @@ return (function () {
         if not self._is_image_captcha_page():
             self.logger.debug("No image captcha detected")
             return True
+
+        if not _HAS_DDDDOCR:
+            img_bytes = self._read_captcha_image_bytes()
+            if img_bytes:
+                self._cache_captcha_image(img_bytes)
 
         if _HAS_DDDDOCR:
             self.logger.info(

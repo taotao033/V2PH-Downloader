@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 
-ARCHIVE_ROOT = os.environ.get("V2PH_ARCHIVE", r"D:\v2ph_archive")
+ARCHIVE_ROOT = os.environ.get("V2PH_ARCHIVE", r"F:\v2ph_archive")
 DB_PATH = os.environ.get("V2PH_DB", os.path.join(ARCHIVE_ROOT, "v2ph_profiles.sqlite3"))
 AVATAR_DIR = os.environ.get("V2PH_AVATARS", os.path.join(ARCHIVE_ROOT, "_avatars"))
 COVER_DIR = os.environ.get("V2PH_COVERS", os.path.join(ARCHIVE_ROOT, "_covers"))

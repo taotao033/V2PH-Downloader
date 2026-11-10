@@ -1,8 +1,11 @@
+import hashlib
 import os
+import re
 import time
 import random
 from abc import ABC, abstractmethod
 from logging import Logger
+from pathlib import Path
 from subprocess import run
 from typing import Any
 
@@ -74,6 +77,76 @@ def cf_hard_blocked(title: str | None) -> bool:
     return any(hint in t for hint in CF_HARD_BLOCK_TITLE_HINTS)
 
 
+# Set ``V2DL_SAVE_CAPTCHA=1`` (or ``true``/``yes``/``on``) to persist every
+# captcha image encountered during scraping into a local folder for later OCR
+# training. Output directory defaults to ``./captcha_datasets`` and can be
+# overridden with ``V2DL_CAPTCHA_DATASET_DIR``.
+_CAPTCHA_SAVE_ENV = "V2DL_SAVE_CAPTCHA"
+_CAPTCHA_DIR_ENV = "V2DL_CAPTCHA_DATASET_DIR"
+_DEFAULT_CAPTCHA_DATASET_DIR = "captcha_datasets"
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def captcha_save_enabled() -> bool:
+    """Return True when captcha image caching is enabled via env."""
+    return os.environ.get(_CAPTCHA_SAVE_ENV, "").strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def captcha_dataset_dir() -> Path:
+    """Return the directory where captcha images are stored."""
+    raw = os.environ.get(_CAPTCHA_DIR_ENV, _DEFAULT_CAPTCHA_DATASET_DIR)
+    return Path(raw).expanduser()
+
+
+def _captcha_dataset_filename(img_bytes: bytes, prediction: str | None) -> str:
+    digest = hashlib.sha256(img_bytes).hexdigest()[:8]
+    label = (prediction or "").strip()
+    if label and label.isascii() and label.isalnum():
+        safe = re.sub(r"[^A-Za-z0-9]", "", label)
+        if safe:
+            return f"{safe}_{digest}.png"
+    return f"{digest}.png"
+
+
+def save_captcha_to_dataset(
+    img_bytes: bytes,
+    prediction: str | None = None,
+    logger: Logger | None = None,
+) -> Path | None:
+    """Write a captcha PNG to the dataset folder when caching is enabled.
+
+    Identical image bytes are deduplicated by content hash, so repeated reads
+    of the same challenge only produce one file.
+    """
+    if not captcha_save_enabled():
+        return None
+
+    dest_dir = captcha_dataset_dir()
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        if logger is not None:
+            logger.warning("Failed to create captcha dataset dir %s: %s", dest_dir, e)
+        return None
+
+    dest = dest_dir / _captcha_dataset_filename(img_bytes, prediction)
+    if dest.exists():
+        if logger is not None:
+            logger.debug("Captcha image already cached: %s", dest)
+        return dest
+
+    try:
+        dest.write_bytes(img_bytes)
+    except OSError as e:
+        if logger is not None:
+            logger.warning("Failed to save captcha image to %s: %s", dest, e)
+        return None
+
+    if logger is not None:
+        logger.info("Cached captcha image for OCR dataset: %s", dest)
+    return dest
+
+
 class BaseBot(ABC):
     """Abstract base class for bots, defining shared behaviors."""
 
@@ -95,6 +168,14 @@ class BaseBot(ABC):
         self.private_key, self.public_key = key_pair.private_key, key_pair.public_key
 
         self.new_profile = False
+
+    def _cache_captcha_image(
+        self,
+        img_bytes: bytes,
+        prediction: str | None = None,
+    ) -> Path | None:
+        """Persist a captcha image when ``V2DL_SAVE_CAPTCHA`` is enabled."""
+        return save_captcha_to_dataset(img_bytes, prediction, self.logger)
 
     @abstractmethod
     def init_driver(self) -> Any:
