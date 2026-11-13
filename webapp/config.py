@@ -18,7 +18,7 @@ AVATAR_DIR = os.environ.get("V2PH_AVATARS", os.path.join(ARCHIVE_ROOT, "_avatars
 COVER_DIR = os.environ.get("V2PH_COVERS", os.path.join(ARCHIVE_ROOT, "_covers"))
 
 HOST = os.environ.get("V2PH_HOST", "127.0.0.1")
-PORT = int(os.environ.get("V2PH_PORT", "8000"))
+PORT = int(os.environ.get("V2PH_PORT", "8005"))
 
 SITE_NAME = os.environ.get("V2PH_SITE_NAME", "HerHub")
 SITE_TAGLINE = os.environ.get("V2PH_SITE_TAGLINE", "高清写真图集资源站")

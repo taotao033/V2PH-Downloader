@@ -1259,7 +1259,8 @@ class PageScraper(Generic[PageResultType]):
             ):
                 signals.append(
                     "v2ph image captcha is on the album page and was NOT "
-                    "auto-solved. Install ddddocr (`pip install v2dl[ocr]`) "
+                    "auto-solved. Start the local captcha OCR service "
+                    "(default http://127.0.0.1:8000, see `captcha_ocr_url`) "
                     "or solve the captcha manually in the open browser, "
                     "then re-run."
                 )

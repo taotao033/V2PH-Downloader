@@ -36,6 +36,11 @@ static_config:
   #   avatar_dir      -> <download_dir>/_avatars
   profile_db_path: ""
   avatar_dir: ""
+  # Local captcha OCR service (see the service's README). The bot POSTs the
+  # captcha image to /ocr and only submits answers it marks as accepted.
+  # Override at runtime with V2DL_CAPTCHA_OCR_URL / V2DL_CAPTCHA_OCR_THRESHOLD.
+  captcha_ocr_url: "http://127.0.0.1:8000"
+  captcha_ocr_threshold: 0.5
   chrome_exec_path:
     Linux: "/usr/bin/google-chrome"
     Darwin: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"

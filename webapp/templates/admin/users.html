@@ -5,10 +5,7 @@
 {% block content %}
 {{ section_head(t('admin.title'), 'bi-speedometer2') }}
 
-<div class="admin-tabs">
-  <a href="{{ url_for('admin_dashboard') }}" class="at">{{ t('admin.dashboard') }}</a>
-  <a href="{{ url_for('admin_users') }}" class="at active">{{ t('admin.users') }} ({{ pg.total }})</a>
-</div>
+{% set active = 'users' %}{% set users_total = pg.total %}{% include "admin/_tabs.html" %}
 
 <form class="admin-search" method="get" action="{{ url_for('admin_users') }}">
   <input type="search" name="q" class="form-control" placeholder="{{ t('admin.search_user') }}" value="{{ search or '' }}">

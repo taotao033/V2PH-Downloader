@@ -81,7 +81,6 @@ test = [
 all = [
     "selenium>=4.27.1",
     "pyautogui>=0.9.54",
-    "ddddocr>=1.5.6",
 ]
 # OS-level mouse input used to defeat Cloudflare Turnstile's
 # ``isTrusted`` event check. Optional - if missing, the bot falls
@@ -89,13 +88,9 @@ all = [
 bypass = [
     "pyautogui>=0.9.54",
 ]
-# Local ONNX-based OCR for v2ph's 4-character image captcha. Optional -
-# if missing, the bot skips the auto-solve attempts and goes straight
-# to the manual-input wait loop. ``ddddocr`` pulls in onnxruntime,
-# numpy, opencv-python-headless and pillow (~100MB total).
-ocr = [
-    "ddddocr>=1.5.6",
-]
+# v2ph's 4-character image captcha is solved by a separate local HTTP
+# service (``captcha_ocr_url``, default http://127.0.0.1:8000), so no OCR
+# package or model needs to be installed here.
 
 [project.scripts]
 v2dl = "v2dl:main"

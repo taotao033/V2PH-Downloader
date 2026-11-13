@@ -124,6 +124,8 @@ Cookies 登入比帳號密碼更容易成功。
 - system_log_path: 設定程式執行日誌的位置，該文件預設位於系統設定目錄。
 - rate_limit: 下載速度限制，預設 400 夠用也不會被封鎖。
 - chrome/exec_path: 系統的 Chrome 程式位置。
+- captcha_ocr_url: 驗證碼辨識服務的位址，預設 `http://127.0.0.1:8000`。需要先啟動本地的驗證碼辨識服務（例如在服務專案執行 `python service/api.py --port 8000`），v2ph 的圖片驗證碼會自動送出辨識；服務連不上時才退回手動輸入。可用環境變數 `V2DL_CAPTCHA_OCR_URL` 覆寫。
+- captcha_ocr_threshold: 驗證碼辨識的信心門檻，預設 `0.5`。低於門檻時會重新整理驗證碼而不是送出猜測，調高可提高正確率但需要更多次刷新，調低則相反。可用環境變數 `V2DL_CAPTCHA_OCR_THRESHOLD` 覆寫。
 - encryption_config: 調整加密相關的設定，更高的配置需要花費更長時間解密，預設值已經是最低效能需求了。
 
 ## FAQ
@@ -139,6 +141,10 @@ Cookies 登入比帳號密碼更容易成功。
 - 下載被封鎖
 
 建立 `config.yaml` 設定自己的 headers。
+
+- 驗證碼無法自動辨識
+
+圖片驗證碼交給本地的驗證碼辨識服務處理。請先確認服務已啟動，`GET /health` 應該回傳 `{"ok": true, ...}`（預設位址 `http://127.0.0.1:8000`）；位址不同時設定 `captcha_ocr_url` 或環境變數 `V2DL_CAPTCHA_OCR_URL`。服務連線失敗或多次辨識都沒通過時，程式會退回手動輸入，直接在開啟的瀏覽器輸入驗證碼即可繼續。
 
 - 沒有完整下載
 

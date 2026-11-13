@@ -5,10 +5,7 @@
 {% block content %}
 {{ section_head(t('admin.title'), 'bi-speedometer2') }}
 
-<div class="admin-tabs">
-  <a href="{{ url_for('admin_dashboard') }}" class="at active">{{ t('admin.dashboard') }}</a>
-  <a href="{{ url_for('admin_users') }}" class="at">{{ t('admin.users') }}</a>
-</div>
+{% set active = 'dashboard' %}{% include "admin/_tabs.html" %}
 
 <div class="admin-stats">
   <div class="astat"><i class="bi bi-people"></i><span class="num">{{ stats.users }}</span><span class="lbl">{{ t('admin.stat_users') }}</span></div>

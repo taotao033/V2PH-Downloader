@@ -78,6 +78,7 @@
             <li><a class="dropdown-item" href="{{ url_for('pricing') }}"><i class="bi bi-gem"></i> {{ t('nav.pricing') }}</a></li>
             {% if is_admin %}
             <li><a class="dropdown-item" href="{{ url_for('admin_dashboard') }}"><i class="bi bi-speedometer2"></i> {{ t('nav.admin') }}</a></li>
+            <li><a class="dropdown-item" href="{{ url_for('admin_collection') }}"><i class="bi bi-bar-chart-line"></i> {{ t('admin.collection') }}</a></li>
             {% endif %}
             <li><hr class="dropdown-divider"></li>
             <li><a class="dropdown-item" href="{{ url_for('logout') }}"><i class="bi bi-box-arrow-right"></i> {{ t('nav.logout') }}</a></li>

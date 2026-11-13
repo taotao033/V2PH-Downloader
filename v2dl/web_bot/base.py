@@ -11,6 +11,7 @@ from typing import Any
 
 from v2dl.common import Config, const
 from v2dl.security import AccountManager, KeyManager
+from v2dl.web_bot.captcha_ocr import CaptchaOcrClient
 
 # Cloudflare interstitial signal hints. Title fragments that appear in
 # the <title> of the "Just a moment..."-style interstitial across the
@@ -169,6 +170,11 @@ class BaseBot(ABC):
 
         self.new_profile = False
 
+        # Lazily-created client for the local captcha OCR service. No
+        # network I/O happens until a captcha actually fires - most
+        # albums never hit the gate.
+        self._ocr_client: CaptchaOcrClient | None = None
+
     def _cache_captcha_image(
         self,
         img_bytes: bytes,
@@ -176,6 +182,23 @@ class BaseBot(ABC):
     ) -> Path | None:
         """Persist a captcha image when ``V2DL_SAVE_CAPTCHA`` is enabled."""
         return save_captcha_to_dataset(img_bytes, prediction, self.logger)
+
+    def captcha_ocr_client(self) -> CaptchaOcrClient:
+        """Return the shared client for the local captcha OCR service.
+
+        The client is created on first use, so runs that never encounter
+        an image captcha pay nothing. ``captcha_ocr_url`` and
+        ``captcha_ocr_threshold`` in config.yaml (or the
+        ``V2DL_CAPTCHA_OCR_URL`` / ``V2DL_CAPTCHA_OCR_THRESHOLD`` env
+        vars) choose the service and the confidence gate.
+        """
+        if self._ocr_client is None:
+            static = self.config.static_config
+            self._ocr_client = CaptchaOcrClient(
+                base_url=static.captcha_ocr_url,
+                threshold=static.captcha_ocr_threshold,
+            )
+        return self._ocr_client
 
     @abstractmethod
     def init_driver(self) -> Any:

@@ -17,7 +17,7 @@ from datetime import timedelta
 from flask import (Flask, Response, abort, flash, g, redirect, render_template,
                    request, send_file, session, url_for)
 
-from . import config, db, i18n, media, users
+from . import config, db, i18n, media, reports, users
 from .migrate import REGION_LABELS
 
 
@@ -519,6 +519,34 @@ def create_app() -> Flask:
         rows = users.list_users(search, per, (pg["page"] - 1) * per)
         return render_template("admin/users.html", users=rows, pg=pg, search=search,
                                is_vip=users.is_vip, is_admin_fn=users.is_admin)
+
+    @app.route("/admin/collection")
+    def admin_collection():
+        guard = admin_required()
+        if guard:
+            return guard
+        rng = reports.parse_range(request.args.get("range"))
+        return render_template(
+            "admin/collection.html",
+            report=reports.build_report(rng),
+            rng=rng.key,
+            ranges=reports.RANGE_CHOICES,
+        )
+
+    @app.route("/admin/collection/export")
+    def admin_collection_export():
+        guard = admin_required()
+        if guard:
+            return guard
+        rng = reports.parse_range(request.args.get("range"))
+        report = reports.build_report(rng)
+        csv_text = reports.report_csv(report, lambda key: i18n.translate(g.lang, key))
+        filename = report["filename"]
+        return Response(
+            "\ufeff" + csv_text,
+            mimetype="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.route("/admin/users/<int:user_id>/vip", methods=["POST"])
     def admin_user_vip(user_id):

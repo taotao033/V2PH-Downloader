@@ -28,19 +28,7 @@ from v2dl.web_bot.base import (
     cf_hard_blocked,
     cf_simple_blocked,
 )
-
-# Optional ONNX-based local OCR for v2ph's 4-character image captcha.
-# Used to auto-solve the captcha a few times before falling back to
-# the manual-input wait loop. Install with ``pip install v2dl[ocr]``
-# or ``pip install ddddocr``. Without it the auto-solve step is just
-# skipped and the user is asked to type the captcha manually.
-try:
-    import ddddocr  # type: ignore[import-not-found]
-
-    _HAS_DDDDOCR = True
-except Exception:
-    ddddocr = None  # type: ignore[assignment]
-    _HAS_DDDDOCR = False
+from v2dl.web_bot.captcha_ocr import CaptchaOcrError, is_plausible_captcha_text
 
 if TYPE_CHECKING:
     from v2dl.common import Config
@@ -74,11 +62,6 @@ class SeleniumBot(BaseBot):
         self._cdn_window_handle: str | None = None
         self._cdn_warmup_url: str | None = None
         self._cdn_runjs_warning_logged: bool = False
-        # Lazily-initialised ddddocr instance and an init-failure latch.
-        # We don't load the ONNX model until the first captcha actually
-        # fires (~200 ms warm-up + a few MB of RAM).
-        self._ocr: Any = None
-        self._ocr_init_failed: bool = False
 
     def init_driver(self) -> None:
         self.driver: WebDriver
@@ -659,27 +642,8 @@ return (function () {
     _CAPTCHA_SUBMIT_WAIT = 6.0
     _CAPTCHA_REFRESH_WAIT = 60.0
     _CAPTCHA_PRE_OCR_REFRESH_COUNT = 1
-
-    def _get_ocr(self) -> Any:
-        """Return a lazily-initialised ``ddddocr.DdddOcr`` instance, or
-        ``None`` if ddddocr isn't installed or initialisation
-        previously failed.
-        """
-        if self._ocr_init_failed or not _HAS_DDDDOCR or ddddocr is None:
-            return None
-        if self._ocr is not None:
-            return self._ocr
-        try:
-            self._ocr = ddddocr.DdddOcr(show_ad=False)
-        except Exception as e:
-            self.logger.warning(
-                "ddddocr failed to initialise (%s) - skipping captcha "
-                "auto-solve and falling back to manual input",
-                e,
-            )
-            self._ocr_init_failed = True
-            return None
-        return self._ocr
+    # See ``DrissionBot._CAPTCHA_OCR_MAX_ERRORS``.
+    _CAPTCHA_OCR_MAX_ERRORS = 3
 
     def _read_captcha_image_bytes(self) -> bytes | None:
         """Pull the bytes of the current captcha image out of the
@@ -757,35 +721,41 @@ return (function () {
     def _try_auto_solve_captcha_once(self, attempt: int) -> bool:
         """Run a single OCR-and-submit cycle. Returns True iff the
         captcha page is no longer present after the attempt.
-        """
-        ocr = self._get_ocr()
-        if ocr is None:
-            return False
 
+        The captcha image is sent to the local OCR service; the answer is
+        only typed in when the service reports it as accepted. On a
+        low-confidence answer (or implausible text) we refresh the image
+        instead of submitting.
+
+        Raises:
+            CaptchaOcrError: The OCR service is unreachable or replied
+                with an error; callers treat repeated failures as "service
+                down" and fall back to manual solving.
+        """
         self._refresh_captcha_before_ocr(attempt)
 
         img_bytes = self._read_captcha_image_bytes()
         if not img_bytes:
             return False
 
-        try:
-            prediction = ocr.classification(img_bytes)
-        except Exception as e:
-            self.logger.debug("ddddocr inference failed: %s", e)
+        result = self.captcha_ocr_client().recognize(img_bytes)
+        text = result.text.strip()
+        self._cache_captcha_image(img_bytes, prediction=text or None)
+
+        if not result.accepted:
+            self.logger.info(
+                "Captcha auto-solve attempt %d/%d: OCR predicted %r at "
+                "conf=%.3f, below the acceptance threshold - refreshing "
+                "image",
+                attempt, self._CAPTCHA_AUTO_ATTEMPTS, text, result.conf,
+            )
+            self._refresh_captcha_image()
             return False
 
-        text = prediction.strip() if isinstance(prediction, str) else ""
-        self._cache_captcha_image(img_bytes, prediction=text or None)
-        # v2ph's captcha is always 4 ASCII alphanumeric characters.
-        # If OCR returns punctuation / whitespace / non-ASCII it's
-        # garbage; refresh and skip the submit.
-        if (
-            not text
-            or len(text) < 3
-            or len(text) > 8
-            or not text.isascii()
-            or not text.isalnum()
-        ):
+        # The service always emits 4 characters from v2ph's alphabet; this
+        # guard catches a captcha_ocr_url that points at some other API
+        # which happens to answer with JSON.
+        if not is_plausible_captcha_text(text):
             self.logger.info(
                 "Captcha auto-solve attempt %d/%d: OCR returned %r, "
                 "refreshing image",
@@ -795,8 +765,9 @@ return (function () {
             return False
 
         self.logger.info(
-            "Captcha auto-solve attempt %d/%d: submitting OCR prediction %r",
-            attempt, self._CAPTCHA_AUTO_ATTEMPTS, text,
+            "Captcha auto-solve attempt %d/%d: submitting OCR prediction "
+            "%r (conf=%.3f)",
+            attempt, self._CAPTCHA_AUTO_ATTEMPTS, text, result.conf,
         )
 
         try:
@@ -829,9 +800,10 @@ return (function () {
         """Detect v2ph's image captcha and clear it.
 
         Strategy mirrors :py:meth:`DrissionBot.handle_image_captcha`:
-        try ddddocr-based auto-solve up to
+        auto-solve through the local OCR service up to
         :py:attr:`_CAPTCHA_AUTO_ATTEMPTS` times, then fall back to the
-        manual-input wait loop. v2ph reuses the same
+        manual-input wait loop if the service is unreachable or does not
+        clear the gate. v2ph reuses the same
         ``#album-captcha-form`` markup for both the legacy inline
         layout and the newer full-page card, so the auto-solver works
         against either unchanged.
@@ -840,18 +812,30 @@ return (function () {
             self.logger.debug("No image captcha detected")
             return True
 
-        if not _HAS_DDDDOCR:
+        client = self.captcha_ocr_client()
+        if not client.available():
             img_bytes = self._read_captcha_image_bytes()
             if img_bytes:
                 self._cache_captcha_image(img_bytes)
-
-        if _HAS_DDDDOCR:
-            self.logger.info(
-                "Image captcha detected - attempting auto-solve via "
-                "ddddocr (up to %d attempts)",
-                self._CAPTCHA_AUTO_ATTEMPTS,
+            self.logger.warning(
+                "Image captcha detected but the OCR service at %s is not "
+                "reachable - solve the captcha in the opened browser (use "
+                "F5 to refresh the image if needed). Start the service "
+                "(e.g. `python service/api.py --port 8000`) or point "
+                "`captcha_ocr_url` / V2DL_CAPTCHA_OCR_URL at it. The "
+                "download resumes automatically once verified.",
+                client.base_url,
             )
+        else:
+            self.logger.info(
+                "Image captcha detected - attempting auto-solve via the "
+                "OCR service at %s (up to %d attempts)",
+                client.base_url, self._CAPTCHA_AUTO_ATTEMPTS,
+            )
+            consecutive_errors = 0
+            attempts_made = 0
             for attempt in range(1, self._CAPTCHA_AUTO_ATTEMPTS + 1):
+                attempts_made = attempt
                 try:
                     if self._try_auto_solve_captcha_once(attempt):
                         self.logger.info(
@@ -860,6 +844,21 @@ return (function () {
                             attempt,
                         )
                         return True
+                    consecutive_errors = 0
+                except CaptchaOcrError as e:
+                    consecutive_errors += 1
+                    self.logger.warning(
+                        "Captcha OCR request failed (%d/%d): %s",
+                        consecutive_errors, self._CAPTCHA_OCR_MAX_ERRORS, e,
+                    )
+                    if consecutive_errors >= self._CAPTCHA_OCR_MAX_ERRORS:
+                        self.logger.warning(
+                            "Captcha OCR service at %s stopped answering - "
+                            "falling back to manual solving",
+                            client.base_url,
+                        )
+                        break
+                    time.sleep(random.uniform(0.5, 1.5))
                 except Exception as e:
                     self.logger.debug(
                         "Captcha auto-solve attempt %d errored: %s",
@@ -886,19 +885,11 @@ return (function () {
                     )
 
             self.logger.warning(
-                "Captcha auto-solve gave up after %d attempts - please "
-                "solve the captcha in the opened browser (use F5 to "
-                "refresh the image if needed). The download will resume "
-                "automatically once verified.",
-                self._CAPTCHA_AUTO_ATTEMPTS,
-            )
-        else:
-            self.logger.warning(
-                "Image captcha detected - please solve the captcha in "
-                "the opened browser (use F5 to refresh the image if "
-                "needed). (Install `ddddocr` for automatic solving: "
-                "`pip install v2dl[ocr]`.) The download will resume "
-                "automatically once verified."
+                "Captcha auto-solve did not clear the gate after %d "
+                "attempt(s) - please solve the captcha in the opened "
+                "browser (use F5 to refresh the image if needed). The "
+                "download will resume automatically once verified.",
+                attempts_made,
             )
 
         while True:

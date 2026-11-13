@@ -45,6 +45,12 @@ class StaticConfig:
     profile_db_path: str = ""
     avatar_dir: str = ""
     cover_dir: str = ""
+    # Local HTTP captcha OCR service used to auto-solve v2ph's 4-character
+    # image captcha (see ``v2dl/web_bot/captcha_ocr.py``). The threshold is
+    # the confidence below which the bot refreshes the captcha instead of
+    # submitting a guess; 0.5 matches the service default.
+    captcha_ocr_url: str = "http://127.0.0.1:8000"
+    captcha_ocr_threshold: float = 0.5
 
 
 @dataclass

@@ -134,6 +134,12 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "profile_db_path": "",
         "avatar_dir": "",
         "cover_dir": "",
+        # Local HTTP captcha OCR service (``python service/api.py`` in the
+        # OCR project). The bot only submits an answer the service marks as
+        # accepted; lower the threshold to answer more often, raise it to
+        # trade coverage for accuracy.
+        "captcha_ocr_url": "http://127.0.0.1:8000",
+        "captcha_ocr_threshold": 0.5,
     },
     "runtime_config": {
         "url": "",

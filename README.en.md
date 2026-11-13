@@ -118,6 +118,8 @@ In this file, you can modify settings like headers, language, scroll length, scr
 - **system_log_path**: Location for program logs. The default location is the system configuration directory.
 - **rate_limit**: Download speed limit, default is 400, which is sufficient and prevents being blocked.
 - **chrome/exec_path**: Path to the system's Chrome executable.
+- **captcha_ocr_url**: Address of the local captcha OCR service, default `http://127.0.0.1:8000`. Start that service first (e.g. `python service/api.py --port 8000` in the OCR project); v2ph's image captcha is then solved automatically, and the bot only falls back to manual input when the service is unreachable. Override with the `V2DL_CAPTCHA_OCR_URL` environment variable.
+- **captcha_ocr_threshold**: Confidence threshold for captcha recognition, default `0.5`. Answers below it refresh the captcha instead of submitting a guess; raise it for accuracy, lower it for coverage. Override with `V2DL_CAPTCHA_OCR_THRESHOLD`.
 - **encryption_config**: Adjust encryption-related settings. Higher configurations require longer decryption times, and the default value already meets the minimum performance requirements.
 
 ## FAQ
@@ -133,6 +135,10 @@ There are three common causes: a dirty IP, an improperly configured user agent, 
 - Download blocked
 
 Create a `config.yaml` and set your custom headers.
+
+- Captcha is not solved automatically
+
+Image captchas are handled by the local captcha OCR service. Make sure it is running and `GET /health` returns `{"ok": true, ...}` (default address `http://127.0.0.1:8000`); if it lives elsewhere, set `captcha_ocr_url` or the `V2DL_CAPTCHA_OCR_URL` environment variable. When the service is unreachable or repeated attempts do not clear the gate, the bot falls back to manual input - just type the captcha in the open browser to continue.
 
 - Incomplete downloads
 
