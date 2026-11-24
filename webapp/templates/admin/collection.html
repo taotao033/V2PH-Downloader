@@ -1,0 +1,321 @@
+{% extends "base.html" %}
+{% from "_macros.html" import section_head %}
+{% block title %}{{ t('rpt.title') }} · {{ SITE_NAME }}{% endblock %}
+
+{% block content %}
+{{ section_head(t('rpt.title'), 'bi-bar-chart-line') }}
+{% set active = 'collection' %}{% include "admin/_tabs.html" %}
+{% set range_foot = t('rpt.kpi_all_time') if rng == 'all' else t('rpt.kpi_in_range') %}
+{% set active_foot = t('rpt.kpi_all_time') if rng == 'all' else t('rpt.kpi_active_hint') %}
+
+<div class="rpt-toolbar">
+  <div class="rpt-ranges" aria-label="{{ t('rpt.title') }}">
+    {% for key, _days in ranges %}
+    <a class="rrange {{ 'active' if rng == key }}" href="{{ url_for('admin_collection', range=key) }}">{{ t('rpt.range_' ~ key) }}</a>
+    {% endfor %}
+  </div>
+  <div class="rpt-actions">
+    <button type="button" class="btn btn-outline-secondary btn-sm" onclick="window.print()">
+      <i class="bi bi-printer"></i> {{ t('rpt.print') }}
+    </button>
+    <a class="btn btn-outline-accent btn-sm rpt-export" href="{{ url_for('admin_collection_export', range=rng) }}">
+      <i class="bi bi-download"></i> {{ t('rpt.export') }}
+    </a>
+  </div>
+</div>
+
+<div class="rpt-meta">
+  <span><i class="bi bi-calendar-range"></i> {{ report.period_label }}</span>
+  <span><i class="bi bi-clock"></i> {{ t('rpt.generated_at') }} {{ report.generated_at }}</span>
+  <span class="rpt-source" title="{{ report.source }}"><i class="bi bi-database"></i> {{ t('rpt.source') }} {{ report.source }}</span>
+</div>
+
+<div class="rpt-kpis">
+  <div class="rpt-kpi">
+    <div class="kicon"><i class="bi bi-collection"></i></div>
+    <div><div class="knum">{{ report.totals.albums|groupthousands }}</div><div class="klbl">{{ t('rpt.kpi_albums') }}</div><div class="kfoot">{{ t('rpt.kpi_all_time') }}</div></div>
+  </div>
+  <div class="rpt-kpi">
+    <div class="kicon"><i class="bi bi-images"></i></div>
+    <div><div class="knum">{{ report.totals.photos|groupthousands }}</div><div class="klbl">{{ t('rpt.kpi_photos') }}</div><div class="kfoot">{{ t('rpt.kpi_all_time') }}</div></div>
+  </div>
+  <div class="rpt-kpi">
+    <div class="kicon"><i class="bi bi-people"></i></div>
+    <div><div class="knum">{{ report.totals.models|groupthousands }}</div><div class="klbl">{{ t('rpt.kpi_models') }}</div><div class="kfoot">{{ t('rpt.kpi_all_time') }}</div></div>
+  </div>
+  <div class="rpt-kpi">
+    <div class="kicon"><i class="bi bi-building"></i></div>
+    <div><div class="knum">{{ report.totals.vendors|groupthousands }}</div><div class="klbl">{{ t('rpt.kpi_vendors') }}</div><div class="kfoot">{{ t('rpt.kpi_all_time') }}</div></div>
+  </div>
+  <div class="rpt-kpi">
+    <div class="kicon"><i class="bi bi-tags"></i></div>
+    <div><div class="knum">{{ report.totals.tags|groupthousands }}</div><div class="klbl">{{ t('rpt.kpi_tags') }}</div><div class="kfoot">{{ t('rpt.kpi_all_time') }}</div></div>
+  </div>
+  <div class="rpt-kpi accent">
+    <div class="kicon"><i class="bi bi-plus-circle"></i></div>
+    <div><div class="knum">{{ report.kpis.new_albums|groupthousands }}</div><div class="klbl">{{ t('rpt.kpi_new_albums') }}</div><div class="kfoot">{{ range_foot }}</div></div>
+  </div>
+  <div class="rpt-kpi accent">
+    <div class="kicon"><i class="bi bi-file-earmark-image"></i></div>
+    <div><div class="knum">{{ report.kpis.new_photos|groupthousands }}</div><div class="klbl">{{ t('rpt.kpi_new_photos') }}</div><div class="kfoot">{{ range_foot }}</div></div>
+  </div>
+  <div class="rpt-kpi accent">
+    <div class="kicon"><i class="bi bi-person-plus"></i></div>
+    <div><div class="knum">{{ report.kpis.new_models|groupthousands }}</div><div class="klbl">{{ t('rpt.kpi_new_models') }}</div><div class="kfoot">{{ range_foot }}</div></div>
+  </div>
+  <div class="rpt-kpi accent">
+    <div class="kicon"><i class="bi bi-activity"></i></div>
+    <div><div class="knum">{{ report.kpis.active_albums|groupthousands }}</div><div class="klbl">{{ t('rpt.kpi_active') }}</div><div class="kfoot">{{ active_foot }}</div></div>
+  </div>
+  <div class="rpt-kpi accent">
+    <div class="kicon"><i class="bi bi-calendar-check"></i></div>
+    <div><div class="knum">{{ report.kpis.avg_daily }}</div><div class="klbl">{{ t('rpt.kpi_avg_daily') }}</div><div class="kfoot">{{ range_foot }}</div></div>
+  </div>
+</div>
+
+<div class="rpt-grid">
+  <section class="rpt-panel span-12">
+    <div class="rpt-panel-head">
+      <h3><i class="bi bi-graph-up"></i> {{ t('rpt.trend') }}</h3>
+      <span class="rpt-note">{{ t('rpt.trend_desc') }}</span>
+    </div>
+    {% if report.trend.buckets %}
+    <div class="rpt-chart">
+      <div class="rpt-bars">
+        {% for b in report.trend.buckets %}
+        <div class="rpt-col" title="{{ b.label }} · {{ t('rpt.trend_albums') }} {{ b.albums }} · {{ t('rpt.trend_photos') }} {{ b.photos }} · {{ t('rpt.trend_cum') }} {{ b.cumulative }}">
+          <div class="rpt-bar-wrap">
+            <i class="rpt-bar{{ ' is-zero' if not b.albums }}" style="height: {{ b.height }}%"></i>
+          </div>
+          <span class="rpt-x">{% if b.show_label %}{{ b.label }}{% endif %}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="rpt-chart-foot">
+      <span><i class="bi bi-bar-chart"></i> {{ t('rpt.trend_albums') }} <b>{{ report.trend.total_albums|groupthousands }}</b></span>
+      <span><i class="bi bi-images"></i> {{ t('rpt.trend_photos') }} <b>{{ report.trend.total_photos|groupthousands }}</b></span>
+      <span><i class="bi bi-stack"></i> {{ t('rpt.trend_cum') }} <b>{{ report.trend.end_cumulative|groupthousands }}</b></span>
+      <span class="ms-auto rpt-gran">{{ t('rpt.gran_' ~ report.trend.granularity) }}</span>
+    </div>
+    {% else %}
+    <p class="rpt-empty">{{ t('rpt.trend_empty') }}</p>
+    {% endif %}
+
+    <div class="rpt-subchart">
+      <div class="rpt-subhead">
+        <h4><i class="bi bi-clock"></i> {{ t('rpt.today_hours') }}</h4>
+        <div class="rpt-head-meta">
+          <span class="rpt-note">{{ t('rpt.today_hours_desc') }}</span>
+          <span class="rpt-now-badge"><i class="bi bi-broadcast"></i> {{ t('rpt.now') }} {{ '%02d:00'|format(report.today_hours.current_hour) }}</span>
+        </div>
+      </div>
+      <div class="rpt-chart">
+        <div class="rpt-bars hourly">
+          {% for h in report.today_hours.buckets %}
+          <div class="rpt-col" title="{{ '%02d:00'|format(h.hour) }} · {{ t('rpt.trend_albums') }} {{ h.albums }} · {{ t('rpt.trend_photos') }} {{ h.photos }}">
+            <div class="rpt-bar-wrap">
+              <i class="rpt-bar{{ ' is-zero' if not h.albums }}{{ ' is-now' if h.is_now }}" style="height: {{ h.height }}%"></i>
+            </div>
+            <span class="rpt-x">{% if h.show_label %}{{ '%02d'|format(h.hour) }}{% endif %}</span>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="rpt-chart-foot">
+        <span><i class="bi bi-bar-chart"></i> {{ t('rpt.trend_albums') }} <b>{{ report.today_hours.total_albums|groupthousands }}</b></span>
+        <span><i class="bi bi-images"></i> {{ t('rpt.trend_photos') }} <b>{{ report.today_hours.total_photos|groupthousands }}</b></span>
+        {% if report.today_hours.peak_albums %}
+        <span><i class="bi bi-graph-up-arrow"></i> {{ t('rpt.peak') }} {{ '%02d:00'|format(report.today_hours.peak_hour) }} · <b>{{ report.today_hours.peak_albums|groupthousands }}</b></span>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  <section class="rpt-panel span-7">
+    <div class="rpt-panel-head">
+      <h3><i class="bi bi-clipboard-check"></i> {{ t('rpt.quality') }}</h3>
+      <span class="rpt-note">{{ t('rpt.quality_desc') }}</span>
+    </div>
+    <div class="rpt-q-list">
+      {% for q in report.quality %}
+      <div class="rpt-q-row">
+        <div class="rpt-q-top">
+          <span>{{ t(q.label) }}</span>
+          <span class="rpt-q-val">{{ '%.1f'|format(q.pct) }}%</span>
+        </div>
+        <div class="rpt-progress"><i style="width: {{ q.pct }}%"></i></div>
+        <div class="rpt-q-sub">{{ q.value|groupthousands }} / {{ q.total|groupthousands }}</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="rpt-attn">
+      {% for a in report.attention %}
+      <span class="rpt-attn-item{{ ' is-warn' if a.count }}"><b>{{ a.count|groupthousands }}</b> {{ t(a.label) }}</span>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="rpt-panel span-5">
+    <div class="rpt-panel-head">
+      <h3><i class="bi bi-distribute-vertical"></i> {{ t('rpt.sizes') }}</h3>
+    </div>
+    {% for s in report.sizes %}
+    <div class="rpt-size-row">
+      <span class="rpt-size-lbl">{{ t(s.label) }}</span>
+      <div class="rpt-progress"><i style="width: {{ s.pct }}%"></i></div>
+      <span class="rpt-size-val">{{ s.count|groupthousands }}</span>
+    </div>
+    {% endfor %}
+  </section>
+
+  <section class="rpt-panel span-7">
+    <div class="rpt-panel-head">
+      <h3><i class="bi bi-globe2"></i> {{ t('rpt.region') }}</h3>
+      <span class="rpt-note">{{ t('rpt.region_desc') }}</span>
+    </div>
+    <div class="table-responsive">
+      <table class="table rpt-table align-middle">
+        <thead>
+          <tr>
+            <th>{{ t('rpt.col_region') }}</th>
+            <th class="num">{{ t('rpt.col_models') }}</th>
+            <th class="num">{{ t('rpt.col_albums') }}</th>
+            <th class="num">{{ t('rpt.col_photos') }}</th>
+            <th class="rpt-share-col">{{ t('rpt.col_share') }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in report.regions %}
+          <tr>
+            <td>{% if r.key and r.key in REGION_LABELS %}{{ t('region.' ~ r.key) }}{% else %}<span class="text-muted">{{ t('rpt.unknown_region') }}</span>{% endif %}</td>
+            <td class="num">{{ r.models|groupthousands }}</td>
+            <td class="num">{{ r.albums|groupthousands }}</td>
+            <td class="num">{{ r.photos|groupthousands }}</td>
+            <td><div class="rpt-share-cell"><span>{{ '%.1f'|format(r.pct) }}%</span><div class="rpt-mini"><i style="width: {{ r.pct }}%"></i></div></div></td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="rpt-empty">{{ t('rpt.none') }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="rpt-panel span-5">
+    <div class="rpt-panel-head">
+      <h3><i class="bi bi-tags"></i> {{ t('rpt.tags') }}</h3>
+    </div>
+    <div class="rpt-tags">
+      {% for tg in report.tags %}
+      <a class="rpt-tag" href="{{ url_for('tag', name=tg.name) }}">{{ tg.name }}<span>{{ tg.albums|groupthousands }}</span></a>
+      {% else %}
+      <p class="rpt-empty">{{ t('rpt.none') }}</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="rpt-panel span-6">
+    <div class="rpt-panel-head">
+      <h3><i class="bi bi-building"></i> {{ t('rpt.vendors') }}</h3>
+    </div>
+    <div class="table-responsive">
+      <table class="table rpt-table align-middle">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>{{ t('rpt.col_name') }}</th>
+            <th class="num">{{ t('rpt.col_albums') }}</th>
+            <th class="num">{{ t('rpt.col_photos') }}</th>
+            <th class="rpt-share-col">{{ t('rpt.col_share') }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for v in report.vendors %}
+          <tr>
+            <td class="rpt-rank">{{ loop.index }}</td>
+            <td>{% if v.slug %}<a href="{{ url_for('vendor', slug=v.slug) }}">{{ v.name }}</a>{% else %}{{ v.name }}{% endif %}</td>
+            <td class="num">{{ v.albums|groupthousands }}</td>
+            <td class="num">{{ v.photos|groupthousands }}</td>
+            <td><div class="rpt-share-cell"><span>{{ '%.1f'|format(v.pct) }}%</span><div class="rpt-mini"><i style="width: {{ v.pct }}%"></i></div></div></td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="rpt-empty">{{ t('rpt.none') }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="rpt-panel span-6">
+    <div class="rpt-panel-head">
+      <h3><i class="bi bi-person-badge"></i> {{ t('rpt.models') }}</h3>
+    </div>
+    <div class="table-responsive">
+      <table class="table rpt-table align-middle">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>{{ t('rpt.col_name') }}</th>
+            <th class="num">{{ t('rpt.col_albums') }}</th>
+            <th class="num">{{ t('rpt.col_photos') }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for m in report.models %}
+          <tr>
+            <td class="rpt-rank">{{ loop.index }}</td>
+            <td>
+              <div class="rpt-model">
+                <img class="rpt-avatar" loading="lazy" src="{{ m|avatar }}" alt="">
+                <div>
+                  <a href="{{ url_for('model', slug=m.slug) }}">{{ m.name }}</a>
+                  <div class="rpt-sub">{% if m.region and m.region in REGION_LABELS %}{{ t('region.' ~ m.region) }}{% else %}{{ t('rpt.unknown_region') }}{% endif %}</div>
+                </div>
+              </div>
+            </td>
+            <td class="num">{{ m.albums|groupthousands }}</td>
+            <td class="num">{{ m.photos|groupthousands }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="rpt-empty">{{ t('rpt.none') }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="rpt-panel span-12">
+    <div class="rpt-panel-head">
+      <h3><i class="bi bi-clock-history"></i> {{ t('rpt.recent') }}</h3>
+      <span class="rpt-note">{{ t('rpt.recent_desc') }}</span>
+    </div>
+    <div class="table-responsive">
+      <table class="table rpt-table align-middle">
+        <thead>
+          <tr>
+            <th>{{ t('rpt.col_time') }}</th>
+            <th>{{ t('rpt.col_name') }}</th>
+            <th>{{ t('rpt.col_models') }}</th>
+            <th class="num">{{ t('rpt.col_photos') }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for a in report.recent %}
+          <tr>
+            <td class="small text-muted">{{ a.updated_at }}</td>
+            <td><a href="{{ url_for('album', slug=a.slug) }}">{{ a.title }}</a></td>
+            <td>{% if a.actor %}{% if a.actor_slug %}<a href="{{ url_for('model', slug=a.actor_slug) }}">{{ a.actor }}</a>{% else %}{{ a.actor }}{% endif %}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+            <td class="num">{{ a.photos|groupthousands }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="rpt-empty">{{ t('rpt.none') }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<p class="rpt-footnote"><i class="bi bi-info-circle"></i> {{ t('rpt.footnote') }}</p>
+{% endblock %}

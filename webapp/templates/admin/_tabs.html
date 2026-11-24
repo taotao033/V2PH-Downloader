@@ -1,0 +1,5 @@
+<div class="admin-tabs">
+  <a href="{{ url_for('admin_dashboard') }}" class="at {{ 'active' if active == 'dashboard' else '' }}">{{ t('admin.dashboard') }}</a>
+  <a href="{{ url_for('admin_users') }}" class="at {{ 'active' if active == 'users' else '' }}">{{ t('admin.users') }}{% if users_total is defined and users_total %} ({{ users_total }}){% endif %}</a>
+  <a href="{{ url_for('admin_collection') }}" class="at {{ 'active' if active == 'collection' else '' }}">{{ t('admin.collection') }}</a>
+</div>
