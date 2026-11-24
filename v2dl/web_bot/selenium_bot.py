@@ -725,7 +725,9 @@ return (function () {
         The captcha image is sent to the local OCR service; the answer is
         only typed in when the service reports it as accepted. On a
         low-confidence answer (or implausible text) we refresh the image
-        instead of submitting.
+        instead of submitting. The image is cached only once the site
+        confirms the answer, so ``V2DL_SAVE_CAPTCHA`` collects verified,
+        auto-labelled samples.
 
         Raises:
             CaptchaOcrError: The OCR service is unreachable or replied
@@ -740,7 +742,6 @@ return (function () {
 
         result = self.captcha_ocr_client().recognize(img_bytes)
         text = result.text.strip()
-        self._cache_captcha_image(img_bytes, prediction=text or None)
 
         if not result.accepted:
             self.logger.info(
@@ -791,6 +792,9 @@ return (function () {
             time.sleep(0.4)
             try:
                 if self._is_captcha_solved():
+                    # The site accepted this answer, so the image + text is a
+                    # verified sample: cache it as auto-labelled training data.
+                    self._cache_captcha_image(img_bytes, prediction=text)
                     return True
             except Exception:
                 pass
@@ -814,9 +818,6 @@ return (function () {
 
         client = self.captcha_ocr_client()
         if not client.available():
-            img_bytes = self._read_captcha_image_bytes()
-            if img_bytes:
-                self._cache_captcha_image(img_bytes)
             self.logger.warning(
                 "Image captcha detected but the OCR service at %s is not "
                 "reachable - solve the captcha in the opened browser (use "

@@ -78,10 +78,12 @@ def cf_hard_blocked(title: str | None) -> bool:
     return any(hint in t for hint in CF_HARD_BLOCK_TITLE_HINTS)
 
 
-# Set ``V2DL_SAVE_CAPTCHA=1`` (or ``true``/``yes``/``on``) to persist every
-# captcha image encountered during scraping into a local folder for later OCR
-# training. Output directory defaults to ``./captcha_datasets`` and can be
-# overridden with ``V2DL_CAPTCHA_DATASET_DIR``.
+# Set ``V2DL_SAVE_CAPTCHA=1`` (or ``true``/``yes``/``on``) to persist captcha
+# images that the site actually *verified* during scraping, together with the
+# answer that solved them. Only accepted answers are written, so the folder is
+# an auto-labelled dataset ready for incremental OCR training. Output directory
+# defaults to ``./captcha_datasets`` and can be overridden with
+# ``V2DL_CAPTCHA_DATASET_DIR``.
 _CAPTCHA_SAVE_ENV = "V2DL_SAVE_CAPTCHA"
 _CAPTCHA_DIR_ENV = "V2DL_CAPTCHA_DATASET_DIR"
 _DEFAULT_CAPTCHA_DATASET_DIR = "captcha_datasets"
@@ -114,10 +116,12 @@ def save_captcha_to_dataset(
     prediction: str | None = None,
     logger: Logger | None = None,
 ) -> Path | None:
-    """Write a captcha PNG to the dataset folder when caching is enabled.
+    """Write a verified captcha PNG to the dataset folder when caching is enabled.
 
-    Identical image bytes are deduplicated by content hash, so repeated reads
-    of the same challenge only produce one file.
+    Callers must only pass samples whose answer the site accepted: the
+    ``prediction`` becomes the label, so unverified guesses would poison the
+    training set. Identical image bytes are deduplicated by content hash, so
+    the same challenge is only stored once.
     """
     if not captcha_save_enabled():
         return None
@@ -180,7 +184,12 @@ class BaseBot(ABC):
         img_bytes: bytes,
         prediction: str | None = None,
     ) -> Path | None:
-        """Persist a captcha image when ``V2DL_SAVE_CAPTCHA`` is enabled."""
+        """Persist a site-verified captcha image together with its answer.
+
+        Only call this after the captcha gate has been observed as solved;
+        that turns ``V2DL_SAVE_CAPTCHA`` into an auto-labelled dataset for
+        incremental OCR training.
+        """
         return save_captcha_to_dataset(img_bytes, prediction, self.logger)
 
     def captcha_ocr_client(self) -> CaptchaOcrClient:
